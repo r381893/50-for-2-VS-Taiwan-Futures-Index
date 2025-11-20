@@ -150,15 +150,21 @@ if df is not None:
         rebalance_short_target = 0.5
 
     # Date Range Filter
-    min_date = df.index.min()
-    max_date = df.index.max()
-    
-    start_date, end_date = st.sidebar.date_input(
-        "選擇回測日期範圍",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
-    )
+    if df.empty:
+        st.warning("⚠️ 載入的資料為空，請檢查資料來源或日期範圍。")
+    else:
+        min_date = df.index.min()
+        max_date = df.index.max()
+        
+        if pd.isna(min_date) or pd.isna(max_date):
+            st.error("⚠️ 資料日期格式錯誤 (NaT)，無法進行回測。")
+        else:
+            start_date, end_date = st.sidebar.date_input(
+                "選擇回測日期範圍",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date
+            )
     
     # Filter data
     mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
