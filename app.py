@@ -428,6 +428,9 @@ if df is not None:
     cost_tax = st.sidebar.number_input("交易稅率", value=0.00002, step=0.00001, format="%.5f")
     cost_slippage = st.sidebar.number_input("滑價 (點數)", value=1, step=1)
     include_costs = st.sidebar.checkbox("是否計入交易成本", value=True)
+    
+    st.sidebar.subheader("風險控管設定")
+    margin_per_contract = st.sidebar.number_input("小台單口保證金 (TWD)", value=85000, step=1000)
 
     # Date Range Filter
     if df.empty:
@@ -571,6 +574,28 @@ if df is not None:
                         st.metric("進場指數", f"{entry_price:,.0f}")
                         st.metric("目前指數", f"{last_close:,.0f}", delta=f"{last_close - entry_price:,.0f}", delta_color="inverse")
                         st.metric("空單損益 (TWD)", f"{profit_twd:,.0f}", delta=f"{roi:.2%}")
+                        
+                        # Risk Indicator
+                        st.markdown("---")
+                        st.markdown("#### ⚠️ 風險指標 (Risk Indicator)")
+                        
+                        current_short_equity_val = df_test['Short_Equity'].iloc[-1]
+                        required_margin = contracts * margin_per_contract
+                        if required_margin > 0:
+                            risk_ratio = current_short_equity_val / required_margin
+                        else:
+                            risk_ratio = 999 # Safe
+                            
+                        risk_color = "red" if risk_ratio < 3.0 else "green"
+                        risk_icon = "🚨" if risk_ratio < 3.0 else "✅"
+                        
+                        # Vertical Stack for better visibility
+                        st.metric("做空帳戶資金 (權益數)", f"{current_short_equity_val:,.0f}")
+                        st.metric("所需保證金", f"{required_margin:,.0f}", help=f"口數 {contracts:.2f} x 保證金 {margin_per_contract:,.0f}")
+                        
+                        # Risk Ratio
+                        st.markdown(f"**風險指標 (目標 > 300%)**")
+                        st.markdown(f"<div style='background-color:#f0f2f6;padding:10px;border-radius:5px;text-align:center;'><span style='color:{risk_color};font-size:2em;font-weight:bold'>{risk_ratio:.0%} {risk_icon}</span></div>", unsafe_allow_html=True)
                     
                     with col_h2:
                         st.markdown("#### 🐂 00631L (多單)")
