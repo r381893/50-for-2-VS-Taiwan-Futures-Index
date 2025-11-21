@@ -5,9 +5,285 @@ import numpy as np
 import os
 import yfinance as yf
 
-st.set_page_config(page_title="台灣五十正2 & 微台 Backtest", layout="wide")
+st.set_page_config(page_title="台灣五十正2 & 小台 Backtest", layout="wide")
 
-st.title("台灣五十正2 (00631L) & 微台指 (Micro Tai) 策略回測")
+st.title("台灣五十正2 (00631L) & 小台指 (Small Tai) 策略回測")
+
+# --- CSS Styling ---
+st.markdown("""
+<style>
+    /* Global Font */
+    html, body, [class*="css"] {
+        font-family: 'Inter', 'Microsoft JhengHei', sans-serif;
+    }
+    
+    /* Metric Card Style */
+    .metric-card {
+        background-color: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        text-align: center;
+        margin-bottom: 10px;
+    }
+    .dark-theme .metric-card {
+        background-color: #262730;
+        border: 1px solid #464b59;
+    }
+    
+    .metric-label {
+        font-size: 0.9rem;
+        color: #666;
+        margin-bottom: 5px;
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: bold;
+        color: #333;
+    }
+    .metric-delta {
+        font-size: 0.9rem;
+        margin-top: 5px;
+    }
+    .delta-pos { color: #d32f2f; } /* Red for Up */
+    .delta-neg { color: #388e3c; } /* Green for Down */
+    
+    /* Tab Styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        background-color: #f0f2f6;
+        border-radius: 5px;
+        padding: 10px 20px;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #ff4b4b;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+def metric_card(label, value, delta=None, delta_color="normal"):
+    delta_html = ""
+    if delta:
+        if delta_color == "inverse":
+            color_class = "delta-neg" if "-" not in str(delta) and float(str(delta).replace(',','').replace('%','')) > 0 else "delta-pos"
+        else:
+            # Normal: Red is Positive (Taiwan Stock), Green is Negative
+            # Assuming input delta is string like "10%" or "-5%"
+            is_positive = "-" not in str(delta) and float(str(delta).replace(',','').replace('%','')) != 0
+            color_class = "delta-pos" if is_positive else "delta-neg"
+            
+        delta_html = f'<div class="metric-delta {color_class}">{delta}</div>'
+        
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+        {delta_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+# --- Core Backtest Function ---
+def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short_allocation_pct, 
+                 short_leverage, hedge_mode, do_rebalance, rebalance_long_target,
+                 cost_fee, cost_tax, cost_slippage, include_costs):
+    
+    df = df_data.copy()
+    
+    # Calculate MA
+    df['MA'] = df['TAIEX'].rolling(window=ma_period).mean()
+    
+    # Position Signal (1 = Short, 0 = Flat)
+    df['Position'] = (df['TAIEX'] < df['MA']).shift(1).fillna(0)
+    
+    # Initialize variables
+    long_capital = initial_capital * long_allocation_pct
+    short_capital_initial = initial_capital * short_allocation_pct
+    
+    long_equity_arr = []
+    short_equity_arr = []
+    total_equity_arr = []
+    
+    total_long_pnl = 0
+    total_short_pnl = 0
+    total_cost = 0
+    
+    current_long_capital = long_capital
+    current_short_capital = short_capital_initial
+    
+    # Buy initial shares of 00631L
+    initial_price_00631L = df['00631L'].iloc[0]
+    shares_00631L = current_long_capital / initial_price_00631L
+    
+    last_month = df.index[0].month
+    
+    trades = []
+    in_trade = False
+    entry_price = 0
+    entry_date = None
+    entry_capital = 0
+    entry_long_equity = 0
+    
+    for i in range(len(df)):
+        date = df.index[i]
+        price_00631L = df['00631L'].iloc[i]
+        price_taiex = df['TAIEX'].iloc[i]
+        position = df['Position'].iloc[i]
+        
+        # --- 1. Long Leg P&L ---
+        long_equity = shares_00631L * price_00631L
+        
+        if i > 0:
+            prev_price_00631L = df['00631L'].iloc[i-1]
+            daily_long_pnl = shares_00631L * (price_00631L - prev_price_00631L)
+            total_long_pnl += daily_long_pnl
+            
+            # --- 2. Short Leg P&L ---
+            prev_taiex = df['TAIEX'].iloc[i-1]
+            idx_ret = (price_taiex - prev_taiex) / prev_taiex
+            
+            if position == 1:
+                # Determine Notional
+                max_short_notional = current_short_capital * short_leverage
+                if hedge_mode == "完全避險 (Neutral Hedge)":
+                    target_short_notional = long_equity * 2
+                    actual_short_notional = min(target_short_notional, max_short_notional)
+                else:
+                    actual_short_notional = max_short_notional
+                
+                short_pnl = actual_short_notional * (-1 * idx_ret)
+                current_short_capital += short_pnl
+                total_short_pnl += short_pnl
+        
+        # --- 3. Transaction Costs & Trade Recording ---
+        # Check for Position Change
+        prev_pos = df['Position'].iloc[i-1] if i > 0 else 0
+        
+        if position != prev_pos:
+            # Calculate Contracts for Cost
+            # Note: This is an approximation. Ideally we calculate contracts based on the capital at that moment.
+            # For simplicity, we use the capital at the beginning of the day/period logic
+            
+            max_short_notional = current_short_capital * short_leverage
+            if hedge_mode == "完全避險 (Neutral Hedge)":
+                target_short_notional = long_equity * 2
+                actual_short_notional = min(target_short_notional, max_short_notional)
+            else:
+                actual_short_notional = max_short_notional
+            
+            contracts = actual_short_notional / (price_taiex * 50) if price_taiex > 0 else 0
+            
+            if contracts > 0 and include_costs:
+                # Cost = Tax + Fee + Slippage
+                # Tax: price * 50 * contracts * tax_rate
+                # Fee: contracts * fee
+                # Slippage: contracts * slippage_points * 50
+                
+                trade_tax = price_taiex * 50 * contracts * cost_tax
+                trade_fee = contracts * cost_fee
+                trade_slippage = contracts * cost_slippage * 50
+                
+                this_trade_cost = trade_tax + trade_fee + trade_slippage
+                current_short_capital -= this_trade_cost
+                total_cost += this_trade_cost
+            else:
+                this_trade_cost = 0
+            
+            # Trade Record Logic
+            if position == 1 and not in_trade: # Entry
+                in_trade = True
+                entry_date = date
+                entry_price = price_taiex
+                entry_capital = current_short_capital # Post-cost
+                entry_long_equity = long_equity
+                
+            elif position == 0 and in_trade: # Exit
+                in_trade = False
+                exit_price = price_taiex
+                points_diff = entry_price - exit_price
+                ret = (entry_price - exit_price) / entry_price
+                
+                # Re-calc contracts for record
+                # (Using entry values for consistency with display)
+                max_short_notional_entry = entry_capital * short_leverage
+                if hedge_mode == "完全避險 (Neutral Hedge)":
+                    target_short_notional_entry = entry_long_equity * 2
+                    actual_short_notional_entry = min(target_short_notional_entry, max_short_notional_entry)
+                else:
+                    actual_short_notional_entry = max_short_notional_entry
+                
+                contracts_entry = actual_short_notional_entry / (entry_price * 50)
+                profit_twd = points_diff * 50 * contracts_entry
+                eff_leverage = actual_short_notional_entry / entry_capital if entry_capital > 0 else 0
+                
+                trades.append({
+                    '進場日期': entry_date, '進場指數': entry_price,
+                    '出場日期': date, '出場指數': exit_price,
+                    '避險口數': contracts_entry, '獲利點數': points_diff,
+                    '獲利金額 (TWD)': profit_twd, '報酬率': ret * eff_leverage
+                })
+
+        short_equity = current_short_capital
+        total_equity = long_equity + short_equity
+        
+        # --- 4. Rebalancing ---
+        current_month = date.month
+        if do_rebalance and i > 0 and current_month != last_month:
+            target_long = total_equity * rebalance_long_target
+            target_short = total_equity * (1 - rebalance_long_target)
+            
+            shares_00631L = target_long / price_00631L
+            current_short_capital = target_short
+            
+            long_equity = target_long
+            short_equity = target_short
+        
+        last_month = current_month
+        
+        long_equity_arr.append(long_equity)
+        short_equity_arr.append(short_equity)
+        total_equity_arr.append(total_equity)
+        
+    # Handle Open Trade at End
+    if in_trade:
+        current_date = df.index[-1]
+        current_price = df['TAIEX'].iloc[-1]
+        points_diff = entry_price - current_price
+        ret = (entry_price - current_price) / entry_price
+        
+        max_short_notional_entry = entry_capital * short_leverage
+        if hedge_mode == "完全避險 (Neutral Hedge)":
+            target_short_notional_entry = entry_long_equity * 2
+            actual_short_notional_entry = min(target_short_notional_entry, max_short_notional_entry)
+        else:
+            actual_short_notional_entry = max_short_notional_entry
+            
+        contracts_entry = actual_short_notional_entry / (entry_price * 50)
+        profit_twd = points_diff * 50 * contracts_entry
+        eff_leverage = actual_short_notional_entry / entry_capital if entry_capital > 0 else 0
+        
+        trades.append({
+            '進場日期': entry_date, '進場指數': entry_price,
+            '出場日期': current_date, '出場指數': current_price,
+            '避險口數': contracts_entry, '獲利點數': points_diff,
+            '獲利金額 (TWD)': profit_twd, '報酬率': ret * eff_leverage, '備註': '持倉中'
+        })
+
+    df['Long_Equity'] = long_equity_arr
+    df['Short_Equity'] = short_equity_arr
+    df['Total_Equity'] = total_equity_arr
+    
+    # Benchmark (Buy & Hold 00631L)
+    df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
+    
+    return df, trades, total_long_pnl, total_short_pnl, total_cost
+
 
 # Sidebar Configuration
 st.sidebar.header("參數設定")
@@ -120,7 +396,7 @@ except Exception as e:
     st.error(f"讀取檔案時發生錯誤: {e}")
 
 if df is not None:
-    # Sidebar Parameters (Restored)
+    # Sidebar Parameters
     initial_capital = st.sidebar.number_input("初始總資金 (TWD)", value=1000000, step=100000)
     ma_period = st.sidebar.number_input("加權指數均線週期 (MA)", value=13, step=1)
 
@@ -129,9 +405,9 @@ if df is not None:
     long_allocation_pct = 0.5
     short_allocation_pct = 0.5
     st.sidebar.write(f"初始做多部位 (00631L): {long_allocation_pct*100}%")
-    st.sidebar.write(f"初始做空部位 (微台): {short_allocation_pct*100}%")
+    st.sidebar.write(f"初始做空部位 (小台): {short_allocation_pct*100}%")
 
-    short_leverage = st.sidebar.slider("微台做空槓桿倍數 (最大資金倍數)", min_value=1.0, max_value=10.0, value=5.0, step=0.1, help="設定微台做空時的『最大』槓桿倍數。")
+    short_leverage = st.sidebar.slider("小台做空槓桿倍數 (最大資金倍數)", min_value=1.0, max_value=10.0, value=5.0, step=0.1, help="設定小台做空時的『最大』槓桿倍數。")
 
     hedge_mode = st.sidebar.radio(
         "避險策略模式",
@@ -143,11 +419,15 @@ if df is not None:
 
     if do_rebalance:
         rebalance_long_target = st.sidebar.slider("動態平衡：做多部位目標比例 (%)", min_value=10, max_value=90, value=70, step=5) / 100.0
-        rebalance_short_target = 1.0 - rebalance_long_target
-        st.sidebar.write(f"每月初將調整為：做多 {rebalance_long_target*100:.0f}% / 做空(現金) {rebalance_short_target*100:.0f}%")
     else:
         rebalance_long_target = 0.5
-        rebalance_short_target = 0.5
+    
+    # Transaction Costs
+    st.sidebar.subheader("交易成本設定")
+    cost_fee = st.sidebar.number_input("單邊手續費 (TWD/口)", value=40, step=10)
+    cost_tax = st.sidebar.number_input("交易稅率", value=0.00002, step=0.00001, format="%.5f")
+    cost_slippage = st.sidebar.number_input("滑價 (點數)", value=1, step=1)
+    include_costs = st.sidebar.checkbox("是否計入交易成本", value=True)
 
     # Date Range Filter
     if df.empty:
@@ -168,119 +448,20 @@ if df is not None:
     
     # Filter data
     mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
-    df_test = df.loc[mask].copy()
+    df_test_raw = df.loc[mask].copy()
     
-    if len(df_test) == 0:
+    if len(df_test_raw) == 0:
         st.warning("選定範圍內無資料")
     else:
-        # Calculate MA
-        df_test['MA'] = df_test['TAIEX'].rolling(window=ma_period).mean()
+        # --- Run Backtest ---
+        df_test, trades, total_long_pnl, total_short_pnl, total_cost = run_backtest(
+            df_test_raw, ma_period, initial_capital, long_allocation_pct, short_allocation_pct,
+            short_leverage, hedge_mode, do_rebalance, rebalance_long_target,
+            cost_fee, cost_tax, cost_slippage, include_costs
+        )
         
-        # --- Strategy Logic (Loop-based for Rebalancing) ---
-        
-        # Initialize columns
-        df_test['Position'] = (df_test['TAIEX'] < df_test['MA']).shift(1).fillna(0) # 1 = Short, 0 = Flat
-        
-        # Define initial capitals for reference in Tabs
-        long_capital = initial_capital * long_allocation_pct
-        short_capital_initial = initial_capital * short_allocation_pct
-        
-        # Arrays to store results
-        long_equity_arr = []
-        short_equity_arr = []
-        total_equity_arr = []
-        
-        # P&L Accumulators
-        total_long_pnl = 0
-        total_short_pnl = 0
-        
-        # Initial State
-        current_long_capital = long_capital
-        current_short_capital = short_capital_initial
-        
-        # Buy initial shares of 00631L
-        initial_price_00631L = df_test['00631L'].iloc[0]
-        shares_00631L = current_long_capital / initial_price_00631L
-        
-        last_month = df_test.index[0].month
-        
-        # Iterate
-        for i in range(len(df_test)):
-            date = df_test.index[i]
-            price_00631L = df_test['00631L'].iloc[i]
-            price_taiex = df_test['TAIEX'].iloc[i]
-            position = df_test['Position'].iloc[i] # Position determined by yesterday's signal
-            
-            # 1. Calculate Equity BEFORE Rebalancing
-            # Long Leg
-            long_equity = shares_00631L * price_00631L
-            
-            if i > 0:
-                # Long P&L (Daily)
-                prev_price_00631L = df_test['00631L'].iloc[i-1]
-                daily_long_pnl = shares_00631L * (price_00631L - prev_price_00631L)
-                total_long_pnl += daily_long_pnl
-                
-                # Short Leg
-                prev_taiex = df_test['TAIEX'].iloc[i-1]
-                idx_ret = (price_taiex - prev_taiex) / prev_taiex
-                
-                # Short P&L
-                if position == 1:
-                    # Determine Notional Value based on Mode
-                    max_short_notional = current_short_capital * short_leverage
-                    
-                    if hedge_mode == "完全避險 (Neutral Hedge)":
-                        # Target: Long Equity * 2 (to offset 2x leverage of 00631L)
-                        target_short_notional = long_equity * 2
-                        # Cap at max capacity
-                        actual_short_notional = min(target_short_notional, max_short_notional)
-                    else:
-                        # Aggressive: Use full capacity
-                        actual_short_notional = max_short_notional
-                    
-                    # Profit = Notional * (-1 * idx_ret)
-                    short_pnl = actual_short_notional * (-1 * idx_ret)
-                    current_short_capital += short_pnl
-                    total_short_pnl += short_pnl
-            
-            short_equity = current_short_capital
-            total_equity = long_equity + short_equity
-            
-            # 2. Rebalancing (Start of Month)
-            current_month = date.month
-            if do_rebalance and i > 0 and current_month != last_month:
-                # Rebalance to Target Ratio
-                target_long = total_equity * rebalance_long_target
-                target_short = total_equity * rebalance_short_target
-                
-                # Adjust Shares
-                shares_00631L = target_long / price_00631L
-                
-                # Adjust Short Capital
-                current_short_capital = target_short
-                
-                # Update Equities for record
-                long_equity = target_long
-                short_equity = target_short
-            
-            last_month = current_month
-            
-            # Store
-            long_equity_arr.append(long_equity)
-            short_equity_arr.append(short_equity)
-            total_equity_arr.append(total_equity)
-            
-        # Assign back to DataFrame
-        df_test['Long_Equity'] = long_equity_arr
-        df_test['Short_Equity'] = short_equity_arr
-        df_test['Total_Equity'] = total_equity_arr
-        
-        # Recalculate Short_Leg_Ret for downstream compatibility (approximate)
-        df_test['Short_Leg_Ret'] = df_test['Short_Equity'].pct_change().fillna(0)
-
         # --- Tabs ---
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 總覽", "📈 績效分析", "📅 週期分析", "📋 交易明細", "🔭 最新訊號判斷"])
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 總覽", "📈 績效分析", "📅 週期分析", "📋 交易明細", "🔭 最新訊號判斷", "🎯 參數敏感度"])
 
         # --- Tab 5: Latest Signal ---
         with tab5:
@@ -292,14 +473,13 @@ if df is not None:
             last_ma = last_row['MA']
             last_00631L = last_row['00631L']
             
-            # Get CURRENT available short capital (from the end of backtest)
             current_short_equity = df_test['Short_Equity'].iloc[-1]
-            current_long_equity = df_test['Long_Equity'].iloc[-1]
+            shares_00631L = df_test['Long_Equity'].iloc[-1] / last_00631L # Approx shares
             
-            # Determine Signal for "Tomorrow" (based on Today's Close)
+            # Determine Signal
             is_bearish = last_close < last_ma
             signal_text = "空方 (跌破均線)" if is_bearish else "多方 (站上均線)"
-            action_text = "⚠️ 啟動避險 (做空微台)" if is_bearish else "✅ 僅持有做多部位 (00631L)"
+            action_text = "⚠️ 啟動避險 (做空小台)" if is_bearish else "✅ 僅持有做多部位 (00631L)"
             signal_color = "red" if not is_bearish else "green"
             
             st.markdown(f"""
@@ -324,73 +504,135 @@ if df is not None:
             # 1. 00631L Status
             with col_s1:
                 st.markdown("#### 🐂 00631L (做多部位)")
-                # Calculate current P&L
-                curr_val_00631L = shares_00631L * last_00631L
-                
-                st.write(f"**持有股數**：{shares_00631L:,.0f} 股")
+                curr_val_00631L = df_test['Long_Equity'].iloc[-1]
                 st.write(f"**目前市值**：{curr_val_00631L:,.0f} TWD")
                 st.write(f"**約當大盤曝險**：{curr_val_00631L * 2:,.0f} TWD (2倍槓桿)")
-                st.caption("(因有每月動態平衡，累積獲利請參考總覽頁面)")
             
             # 2. Short Leg Status
             with col_s2:
-                st.markdown("#### 🐻 微台 (做空避險部位)")
+                st.markdown("#### 🐻 小台 (做空避險部位)")
                 
-                # Current Holding Status (Today)
                 is_holding_short = last_row['Position'] == 1
                 
                 if is_holding_short:
                     st.write("**目前狀態**：🔴 持有空單中")
+                    
+                    # Reason for holding short
+                    diff_points = last_ma - last_close
+                    st.markdown(f"📉 **持有原因**：目前指數 ({last_close:,.0f}) 低於 {ma_period}MA ({last_ma:,.0f}) 共 **{diff_points:,.0f}** 點")
+                    
+                    # Find Entry
+                    current_trade_entry_index = -1
+                    for i in range(len(df_test)-1, -1, -1):
+                        if df_test['Position'].iloc[i] == 0:
+                            current_trade_entry_index = i + 1
+                            break
+                    if current_trade_entry_index == -1: current_trade_entry_index = 0
+                    
+                    entry_row = df_test.iloc[current_trade_entry_index]
+                    entry_date = df_test.index[current_trade_entry_index]
+                    entry_price = entry_row['TAIEX']
+                    entry_short_capital = entry_row['Short_Equity']
+                    entry_long_equity = entry_row['Long_Equity']
+                    entry_price_00631L = entry_row['00631L']
+                    
+                    # Calculate Notional
+                    max_short_notional = entry_short_capital * short_leverage
+                    if hedge_mode == "完全避險 (Neutral Hedge)":
+                        target_short_notional = entry_long_equity * 2
+                        actual_short_notional = min(target_short_notional, max_short_notional)
+                    else:
+                        actual_short_notional = max_short_notional
+                        
+                    contracts = actual_short_notional / (entry_price * 50)
+                    
+                    # Current Short P&L
+                    points_diff = entry_price - last_close
+                    profit_twd = points_diff * 50 * contracts
+                    ret = (entry_price - last_close) / entry_price
+                    eff_leverage = actual_short_notional / entry_short_capital if entry_short_capital > 0 else 0
+                    roi = ret * eff_leverage
+                    
+                    # Current 00631L P&L
+                    ret_00631L = (last_00631L - entry_price_00631L) / entry_price_00631L
+                    profit_00631L_period = entry_long_equity * ret_00631L
+                    
+                    net_pnl = profit_twd + profit_00631L_period
+                    
+                    st.markdown("---")
+                    st.subheader("⚖️ 避險成效分析 (本次空單持有期間)")
+                    
+                    col_h1, col_h2, col_h3 = st.columns(3)
+                    
+                    with col_h1:
+                        st.markdown("#### 🐻 小台 (空單)")
+                        st.write(f"**進場日期**：{entry_date.strftime('%Y-%m-%d')}")
+                        st.write(f"**避險口數**：{contracts:.2f} 口")
+                        st.metric("進場指數", f"{entry_price:,.0f}")
+                        st.metric("目前指數", f"{last_close:,.0f}", delta=f"{last_close - entry_price:,.0f}", delta_color="inverse")
+                        st.metric("空單損益 (TWD)", f"{profit_twd:,.0f}", delta=f"{roi:.2%}")
+                    
+                    with col_h2:
+                        st.markdown("#### 🐂 00631L (多單)")
+                        st.write(f"**對照期間**：同左")
+                        st.metric("進場價格", f"{entry_price_00631L:.2f}")
+                        st.metric("目前價格", f"{last_00631L:.2f}", delta=f"{last_00631L - entry_price_00631L:.2f}")
+                        st.metric("多單損益 (預估)", f"{profit_00631L_period:,.0f}", delta=f"{ret_00631L:.2%}")
+                        
+                    with col_h3:
+                        st.markdown("#### 💰 總合損益 (Net)")
+                        if net_pnl > 0:
+                            status_text = "✅ 避險/獲利成功"
+                            status_color = "red"
+                        else:
+                            status_text = "🔻 總合虧損"
+                            status_color = "green"
+                        st.markdown(f"**狀態**：<span style='color:{status_color};font-weight:bold;font-size:1.2em'>{status_text}</span>", unsafe_allow_html=True)
+                        st.metric("總合損益 (TWD)", f"{net_pnl:,.0f}", delta=f"{net_pnl/initial_capital:.2%} (佔初始資金)")
+
                 else:
                     st.write("**目前狀態**：⚪ 空手 (無避險)")
-                
-                st.markdown("---")
-                st.markdown("**明日操作指引**")
-                
-                if is_bearish:
-                    # Need to Hedge
-                    # Use CURRENT Short Equity * Leverage
-                    contracts_needed = (current_short_equity * short_leverage) / (last_close * 10)
-                    st.write(f"**建議動作**：{'續抱空單' if is_holding_short else '建立空單'}")
-                    st.write(f"**建議口數**：{contracts_needed:.2f} 口")
-                    st.caption(f"(基於避險資金 {current_short_equity:,.0f} x 槓桿 {short_leverage}倍 / (指數 {last_close:,.0f} * 10))")
-                else:
-                    # No Hedge
-                    st.write(f"**建議動作**：{'平倉空單 (若持有)' if is_holding_short else '維持空手'}")
-                    st.write("**建議口數**：0 口")
-        
+                    st.write(f"**明日操作指引**：{'續抱空單' if is_bearish else '維持空手'}")
+
         with tab1:
             st.subheader("回測結果總覽")
             
-            # Summary Metrics
             final_equity = df_test['Total_Equity'].iloc[-1]
             total_ret = (final_equity - initial_capital) / initial_capital
+            benchmark_ret = (df_test['Benchmark'].iloc[-1] - initial_capital) / initial_capital
             
             col1, col2, col3 = st.columns(3)
-            col1.metric("期末總資產", f"{final_equity:,.0f}")
-            col2.metric("總報酬率", f"{total_ret:.2%}")
-            col3.metric("交易天數", f"{len(df_test)}")
+            with col1: metric_card("期末總資產", f"{final_equity:,.0f}")
+            with col2: metric_card("總報酬率", f"{total_ret:.2%}", delta=f"{total_ret:.2%}")
+            with col3: metric_card("交易天數", f"{len(df_test)}")
             
-            col4, col5 = st.columns(2)
-            col4.metric("🐂 做多總獲利 (00631L)", f"{total_long_pnl:,.0f}", delta=f"{total_long_pnl/initial_capital:.1%}")
-            col5.metric("🐻 做空總獲利 (微台)", f"{total_short_pnl:,.0f}", delta=f"{total_short_pnl/initial_capital:.1%}")
+            col4, col5, col6 = st.columns(3)
+            with col4: metric_card("🐂 做多總獲利", f"{total_long_pnl:,.0f}", delta=f"{total_long_pnl/initial_capital:.1%}")
+            with col5: metric_card("🐻 做空總獲利", f"{total_short_pnl:,.0f}", delta=f"{total_short_pnl/initial_capital:.1%}")
+            with col6: metric_card("💸 總交易成本", f"{total_cost:,.0f}", delta=f"-{total_cost/initial_capital:.1%}", delta_color="inverse")
             
             # Equity Curve
-            st.line_chart(df_test[['Total_Equity', 'Long_Equity', 'Short_Equity']])
+            st.subheader("資產曲線")
+            fig_equity = go.Figure()
+            fig_equity.add_trace(go.Scatter(x=df_test.index, y=df_test['Total_Equity'], mode='lines', name='總資產 (策略)', line=dict(width=3, color='#d32f2f')))
+            fig_equity.add_trace(go.Scatter(x=df_test.index, y=df_test['Benchmark'], mode='lines', name='Buy & Hold 00631L (對照)', line=dict(width=3, color='#9e9e9e')))
+            fig_equity.add_trace(go.Scatter(x=df_test.index, y=df_test['Long_Equity'], mode='lines', name='做多部位', line=dict(width=1.5, dash='dot')))
+            fig_equity.add_trace(go.Scatter(x=df_test.index, y=df_test['Short_Equity'], mode='lines', name='做空部位', line=dict(width=1.5, dash='dot')))
             
-            # Recent 100 Days Trend
+            fig_equity.update_layout(
+                title='策略 vs. 純買進持有 (00631L)',
+                xaxis_title='日期',
+                yaxis_title='金額 (TWD)',
+                hovermode='x unified',
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                template="plotly_white",
+                height=600
+            )
+            st.plotly_chart(fig_equity, use_container_width=True)
+            
+            # Trend Chart
             st.subheader("最近 100 日多空趨勢分析")
             df_recent = df_test.iloc[-100:].copy()
-            
-            # Count Long/Short days
-            short_days = df_recent[df_recent['Position'] == 1].shape[0]
-            long_days = 100 - short_days
-            
-            c1, c2 = st.columns(2)
-            c1.metric("多方天數 (僅持有 00631L)", f"{long_days} 天")
-            c2.metric("空方天數 (啟動避險)", f"{short_days} 天")
-            
-            # Bar Chart for Trend
             df_recent['Color'] = df_recent['Position'].apply(lambda x: 'green' if x == 1 else 'red')
             
             fig_trend = go.Figure()
@@ -398,130 +640,93 @@ if df is not None:
                 x=df_recent.index,
                 y=df_recent['TAIEX'],
                 marker_color=df_recent['Color'],
-                name='Trend'
+                name='趨勢'
             ))
-            
             min_y = df_recent['TAIEX'].min() * 0.95
             max_y = df_recent['TAIEX'].max() * 1.05
-            
             fig_trend.update_layout(
                 title='最近 100 日加權指數多空趨勢 (紅=多方/綠=空方避險)',
                 yaxis_range=[min_y, max_y],
                 showlegend=False,
                 xaxis_title="日期",
-                yaxis_title="加權指數"
+                yaxis_title="加權指數",
+                template="plotly_white"
             )
             st.plotly_chart(fig_trend, use_container_width=True)
 
-        # --- Tab 2: Performance Analysis ---
         with tab2:
             st.subheader("績效統計")
             
-            # MDD Calculation (Total Equity)
+            # MDD
             equity_curve = df_test['Total_Equity']
-            running_max = equity_curve.cummax()
-            drawdown = (equity_curve - running_max) / running_max
+            drawdown = (equity_curve - equity_curve.cummax()) / equity_curve.cummax()
             max_drawdown = drawdown.min()
             
-            # MDD Calculation (Benchmark - TAIEX)
             taiex_curve = df_test['TAIEX']
-            taiex_running_max = taiex_curve.cummax()
-            taiex_drawdown = (taiex_curve - taiex_running_max) / taiex_running_max
+            taiex_drawdown = (taiex_curve - taiex_curve.cummax()) / taiex_curve.cummax()
             taiex_max_drawdown = taiex_drawdown.min()
             
-            # Short Strategy Stats
-            trades_stats = []
-            in_trade = False
-            entry_price = 0
-            
-            for date, row in df_test.iterrows():
-                pos = row['Position']
-                price = row['TAIEX']
-                if pos == 1 and not in_trade:
-                    in_trade = True
-                    entry_price = price
-                elif pos == 0 and in_trade:
-                    in_trade = False
-                    exit_price = price
-                    ret = (entry_price - exit_price) / entry_price
-                    trades_stats.append(ret * short_leverage) # Leveraged Return
-            
-            if in_trade:
-                current_price = df_test['TAIEX'].iloc[-1]
-                ret = (entry_price - current_price) / entry_price
-                trades_stats.append(ret * short_leverage)
-                
-            trades_series = pd.Series(trades_stats)
-            total_trades = len(trades_series)
-            win_rate = (trades_series > 0).mean() if total_trades > 0 else 0
-            avg_ret = trades_series.mean() if total_trades > 0 else 0
-            max_win = trades_series.max() if total_trades > 0 else 0
-            max_loss = trades_series.min() if total_trades > 0 else 0
+            # Trade Stats
+            if trades:
+                df_trades_stats = pd.DataFrame(trades)
+                win_rate = (df_trades_stats['獲利金額 (TWD)'] > 0).mean()
+                avg_profit = df_trades_stats['獲利金額 (TWD)'].mean()
+                total_trades_count = len(df_trades_stats)
+            else:
+                win_rate = 0
+                avg_profit = 0
+                total_trades_count = 0
             
             col_p1, col_p2, col_p3, col_p4 = st.columns(4)
-            col_p1.metric("策略最大回撤 (MDD)", f"{max_drawdown:.2%}")
-            col_p2.metric("大盤最大回撤 (TAIEX)", f"{taiex_max_drawdown:.2%}")
-            col_p3.metric("做空交易次數", f"{total_trades}")
-            col_p4.metric("做空勝率", f"{win_rate:.2%}")
+            with col_p1: metric_card("策略最大回撤 (MDD)", f"{max_drawdown:.2%}", delta_color="inverse")
+            with col_p2: metric_card("大盤最大回撤", f"{taiex_max_drawdown:.2%}", delta_color="inverse")
+            with col_p3: metric_card("做空交易次數", f"{total_trades_count}")
+            with col_p4: metric_card("做空勝率", f"{win_rate:.2%}")
             
-            col_p5, col_p6 = st.columns(2)
-            col_p5.metric("做空最大單筆獲利", f"{max_win:.2%}")
-            col_p6.metric("做空最大單筆虧損", f"{max_loss:.2%}")
-            
-            # Drawdown Chart
             st.subheader("回撤曲線 (Drawdown)")
             fig_dd = go.Figure()
-            fig_dd.add_trace(go.Scatter(x=drawdown.index, y=drawdown, fill='tozeroy', line=dict(color='red'), name='Drawdown'))
-            fig_dd.update_layout(title='總資產回撤幅度', yaxis_title='回撤 %', hovermode="x unified")
+            fig_dd.add_trace(go.Scatter(x=drawdown.index, y=drawdown, fill='tozeroy', line=dict(color='red'), name='回撤'))
+            fig_dd.update_layout(title='總資產回撤幅度', yaxis_title='回撤 %', hovermode="x unified", template="plotly_white")
             st.plotly_chart(fig_dd, use_container_width=True)
 
-        # --- Tab 3: Period Analysis ---
         with tab3:
             st.subheader("年度報酬率與風險分析")
-            
             df_test['Year'] = df_test.index.year
             
-            # 1. Basic Return Stats
             yearly_stats = df_test.groupby('Year').agg({
                 'Total_Equity': ['first', 'last'],
-                'Long_Equity': ['first', 'last'],
-                'Short_Equity': ['first', 'last']
+                'Benchmark': ['first', 'last']
             })
             
             yearly_ret = pd.DataFrame()
             yearly_ret['總資產報酬率'] = (yearly_stats['Total_Equity']['last'] - yearly_stats['Total_Equity']['first']) / yearly_stats['Total_Equity']['first']
-            yearly_ret['00631L 報酬率'] = (yearly_stats['Long_Equity']['last'] - yearly_stats['Long_Equity']['first']) / yearly_stats['Long_Equity']['first']
-            yearly_ret['微台做空 報酬率'] = (yearly_stats['Short_Equity']['last'] - yearly_stats['Short_Equity']['first']) / yearly_stats['Short_Equity']['first']
+            yearly_ret['Benchmark 報酬率'] = (yearly_stats['Benchmark']['last'] - yearly_stats['Benchmark']['first']) / yearly_stats['Benchmark']['first']
+            yearly_ret['超額報酬 (Alpha)'] = yearly_ret['總資產報酬率'] - yearly_ret['Benchmark 報酬率']
             
-            # 2. Yearly MDD Calculation
-            yearly_mdd_strategy = []
-            yearly_mdd_taiex = []
-            years = yearly_ret.index.tolist()
-            
-            for year in years:
+            # Yearly MDD
+            yearly_mdd = []
+            for year in yearly_ret.index:
                 df_year = df_test[df_test['Year'] == year]
-                
-                # Strategy MDD
                 eq = df_year['Total_Equity']
                 dd = (eq - eq.cummax()) / eq.cummax()
-                yearly_mdd_strategy.append(dd.min())
-                
-                # TAIEX MDD
-                tx = df_year['TAIEX']
-                dd_tx = (tx - tx.cummax()) / tx.cummax()
-                yearly_mdd_taiex.append(dd_tx.min())
+                yearly_mdd.append(dd.min())
+            yearly_ret['策略最大回撤 (MDD)'] = yearly_mdd
             
-            yearly_ret['策略最大回撤 (MDD)'] = yearly_mdd_strategy
-            yearly_ret['大盤最大回撤 (TAIEX)'] = yearly_mdd_taiex
-            
-            # Formatting
-            st.dataframe(yearly_ret.style.format("{:.2%}"), use_container_width=True)
+            st.dataframe(
+                yearly_ret,
+                use_container_width=True,
+                column_config={
+                    "總資產報酬率": st.column_config.NumberColumn(format="%.2f %%"),
+                    "Benchmark 報酬率": st.column_config.NumberColumn(format="%.2f %%"),
+                    "超額報酬 (Alpha)": st.column_config.NumberColumn(format="%.2f %%"),
+                    "策略最大回撤 (MDD)": st.column_config.ProgressColumn(format="%.2f %%", min_value=-0.5, max_value=0),
+                }
+            )
             
             st.subheader("月度報酬率分析 (總資產)")
             df_test['Month'] = df_test.index.to_period('M')
             monthly_stats = df_test.groupby('Month')['Total_Equity'].agg(['first', 'last'])
             monthly_stats['Return'] = (monthly_stats['last'] - monthly_stats['first']) / monthly_stats['first']
-            
             monthly_stats['Year'] = monthly_stats.index.year
             monthly_stats['Month_Num'] = monthly_stats.index.month
             pivot_ret = monthly_stats.pivot(index='Year', columns='Month_Num', values='Return')
@@ -536,109 +741,125 @@ if df is not None:
 
         with tab4:
             st.subheader("📋 交易明細")
+            if trades:
+                df_trades = pd.DataFrame(trades)
+                df_trades['進場日期'] = df_trades['進場日期'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, pd.Timestamp) else x)
+                df_trades['出場日期'] = df_trades['出場日期'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, pd.Timestamp) else x)
+                
+                def color_pnl(val):
+                    color = 'red' if val > 0 else 'green'
+                    return f'color: {color}'
+                
+                st.dataframe(df_trades.style.applymap(color_pnl, subset=['獲利金額 (TWD)', '報酬率'])
+                             .format({'進場指數': '{:,.0f}', '出場指數': '{:,.0f}', '避險口數': '{:.2f}', 
+                                      '獲利點數': '{:,.0f}', '獲利金額 (TWD)': '{:,.0f}', '報酬率': '{:.2%}'}),
+                             use_container_width=True)
+                
+                # Export Buttons
+                st.divider()
+                st.subheader("📥 資料匯出")
+                col_ex1, col_ex2 = st.columns(2)
+                
+                csv_trades = df_trades.to_csv(index=False).encode('utf-8-sig')
+                col_ex1.download_button(
+                    label="下載交易明細 (CSV)",
+                    data=csv_trades,
+                    file_name='trades_record.csv',
+                    mime='text/csv',
+                )
+                
+                csv_equity = df_test.to_csv().encode('utf-8-sig')
+                col_ex2.download_button(
+                    label="下載每日資產權益 (CSV)",
+                    data=csv_equity,
+                    file_name='daily_equity.csv',
+                    mime='text/csv',
+                )
+            else:
+                st.info("區間內無做空交易")
+
+        with tab6:
+            st.subheader("🎯 參數敏感度分析 (MA Sensitivity)")
+            st.info("此功能將測試不同均線週期對策略績效的影響。")
             
-            col_t1, col_t2 = st.columns(2)
+            col_sa1, col_sa2 = st.columns(2)
+            ma_start = col_sa1.number_input("MA 起始", value=5, step=1)
+            ma_end = col_sa2.number_input("MA 結束", value=60, step=1)
+            ma_step = st.slider("間隔 (Step)", 1, 10, 2)
             
-            with col_t1:
-                st.markdown("### 🐂 00631L (做多)")
-                st.info("策略：買進持有 (Buy & Hold)")
+            if st.button("開始分析"):
+                progress_bar = st.progress(0)
+                results = []
+                ma_range = range(ma_start, ma_end + 1, ma_step)
+                total_steps = len(ma_range)
                 
-                curr_price_00631L = df_test['00631L'].iloc[-1]
-                
-                st.write(f"**目前持有股數**：{shares_00631L:,.0f}")
-                st.write(f"**目前收盤價**：{curr_price_00631L:,.2f}")
-                st.write(f"**做多部位權益**：{df_test['Long_Equity'].iloc[-1]:,.0f}")
-                
-            with col_t2:
-                st.markdown("### 🐻 微台 (做空)")
-                st.info("策略：跌破均線做空，站上均線平倉")
-                
-                trades = []
-                in_trade = False
-                entry_date = None
-                entry_price = 0
-                entry_capital = 0
-                entry_long_equity = 0
-                
-                for i in range(len(df_test)):
-                    date = df_test.index[i]
-                    row = df_test.iloc[i]
-                    pos = row['Position']
-                    price = row['TAIEX']
+                for idx, ma in enumerate(ma_range):
+                    # Run Backtest (Silent)
+                    _df, _trades, _lp, _sp, _cost = run_backtest(
+                        df_test_raw, ma, initial_capital, long_allocation_pct, short_allocation_pct,
+                        short_leverage, hedge_mode, do_rebalance, rebalance_long_target,
+                        cost_fee, cost_tax, cost_slippage, include_costs
+                    )
                     
-                    if pos == 1 and not in_trade:
-                        in_trade = True
-                        entry_date = date
-                        entry_price = price
-                        entry_capital = row['Short_Equity'] 
-                        entry_long_equity = row['Long_Equity']
-                    elif pos == 0 and in_trade:
-                        in_trade = False
-                        exit_date = date
-                        exit_price = price
-                        points_diff = entry_price - exit_price
-                        ret = (entry_price - exit_price) / entry_price
-                        
-                        # Reconstruct Notional
-                        max_short_notional = entry_capital * short_leverage
-                        if hedge_mode == "完全避險 (Neutral Hedge)":
-                            target_short_notional = entry_long_equity * 2
-                            actual_short_notional = min(target_short_notional, max_short_notional)
-                        else:
-                            actual_short_notional = max_short_notional
-                            
-                        contracts = actual_short_notional / (entry_price * 10)
-                        profit_twd = points_diff * 10 * contracts
-                        
-                        # Effective Leverage for this trade
-                        eff_leverage = actual_short_notional / entry_capital if entry_capital > 0 else 0
-                        
-                        trades.append({
-                            '進場日期': entry_date, '進場指數': entry_price,
-                            '出場日期': exit_date, '出場指數': exit_price,
-                            '避險口數': contracts, '獲利點數': points_diff,
-                            '獲利金額 (TWD)': profit_twd, '報酬率': ret * eff_leverage
-                        })
-                
-                if in_trade:
-                    current_date = df_test.index[-1]
-                    current_price = df_test['TAIEX'].iloc[-1]
-                    points_diff = entry_price - current_price
-                    ret = (entry_price - current_price) / entry_price
+                    final_eq = _df['Total_Equity'].iloc[-1]
+                    ret = (final_eq - initial_capital) / initial_capital
                     
-                    max_short_notional = entry_capital * short_leverage
-                    if hedge_mode == "完全避險 (Neutral Hedge)":
-                        target_short_notional = entry_long_equity * 2
-                        actual_short_notional = min(target_short_notional, max_short_notional)
-                    else:
-                        actual_short_notional = max_short_notional
-                        
-                    contracts = actual_short_notional / (entry_price * 10)
-                    profit_twd = points_diff * 10 * contracts
-                    eff_leverage = actual_short_notional / entry_capital if entry_capital > 0 else 0
+                    eq_curve = _df['Total_Equity']
+                    mdd = ((eq_curve - eq_curve.cummax()) / eq_curve.cummax()).min()
                     
-                    trades.append({
-                        '進場日期': entry_date, '進場指數': entry_price,
-                        '出場日期': current_date, '出場指數': current_price,
-                        '避險口數': contracts, '獲利點數': points_diff,
-                        '獲利金額 (TWD)': profit_twd, '報酬率': ret * eff_leverage, '備註': '持倉中'
+                    results.append({
+                        'MA': ma,
+                        'Return': ret,
+                        'MDD': mdd
                     })
-                    
-                if trades:
-                    df_trades = pd.DataFrame(trades)
-                    df_trades['進場日期'] = df_trades['進場日期'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, pd.Timestamp) else x)
-                    df_trades['出場日期'] = df_trades['出場日期'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, pd.Timestamp) else x)
-                    
-                    def color_pnl(val):
-                        color = 'red' if val > 0 else 'green'
-                        return f'color: {color}'
-                    
-                    st.dataframe(df_trades.style.applymap(color_pnl, subset=['獲利金額 (TWD)', '報酬率'])
-                                 .format({'進場指數': '{:,.0f}', '出場指數': '{:,.0f}', '避險口數': '{:.2f}', 
-                                          '獲利點數': '{:,.0f}', '獲利金額 (TWD)': '{:,.0f}', '報酬率': '{:.2%}'}),
-                                 use_container_width=True)
-                else:
-                    st.info("區間內無做空交易")
+                    progress_bar.progress((idx + 1) / total_steps)
+                
+                df_sa = pd.DataFrame(results)
+                
+                # Visualization
+                st.subheader("報酬率 vs. 均線週期")
+                fig_sa_ret = go.Figure(go.Bar(
+                    x=df_sa['MA'],
+                    y=df_sa['Return'],
+                    marker_color=df_sa['Return'],
+                    marker_colorscale='RdBu',
+                    name='Return'
+                ))
+                fig_sa_ret.update_layout(xaxis_title="MA Period", yaxis_title="Return", template="plotly_white")
+                st.plotly_chart(fig_sa_ret, use_container_width=True)
+                
+                st.info("""
+                **💡 如何解讀報酬率圖表：**
+                *   **X 軸 (MA Period)**：代表不同的均線參數（例如 10 代表 10日線）。
+                *   **Y 軸 (Return)**：代表該參數下的總報酬率。
+                *   **尋找「高原區」**：不要只選最高的那一根柱子（可能是運氣好）。請尋找**連續多根柱子都維持高報酬**的區域（例如 20~30 附近都很高），這代表該參數區間比較穩定，不易失效。
+                """)
+                
+                st.subheader("最大回撤 (MDD) vs. 均線週期")
+                fig_sa_mdd = go.Figure(go.Bar(
+                    x=df_sa['MA'],
+                    y=df_sa['MDD'],
+                    marker_color='red',
+                    name='MDD'
+                ))
+                fig_sa_mdd.update_layout(xaxis_title="MA Period", yaxis_title="MDD", template="plotly_white")
+                st.plotly_chart(fig_sa_mdd, use_container_width=True)
+                
+                st.info("""
+                **💡 如何解讀最大回撤圖表：**
+                *   **數值越負，風險越高**：柱子越長（往下延伸），代表歷史上曾經發生的最大虧損幅度越大。
+                *   **尋找「淺水區」**：選擇回撤相對較小（柱子較短）的參數，代表策略在逆風時的防守能力較強。
+                """)
+                
+                st.markdown("---")
+                st.markdown("""
+                ### 🏆 總結：如何選擇最佳參數？
+                最佳的參數通常是 **「報酬率高 (高原區)」** 與 **「回撤風險低 (淺水區)」** 的交集。
+                *   若某個參數報酬率極高，但回撤也極大，可能不適合心臟不夠強的投資人。
+                *   建議選擇一個**位於穩定的高原區中間**的數值，而不是極端值，以避免「過度擬合 (Overfitting)」的風險。
+                """)
+                
+                st.success("分析完成！")
 
 else:
     st.info("請上傳 00631L 和 加權指數 的 Excel 檔案，或確認目錄下是否有預設檔案。")
