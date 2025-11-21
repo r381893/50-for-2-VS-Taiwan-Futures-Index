@@ -91,7 +91,7 @@ def metric_card(label, value, delta=None, delta_color="normal"):
 
 # --- Core Backtest Function ---
 def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short_allocation_pct, 
-                 short_leverage, hedge_mode, do_rebalance, rebalance_long_target,
+                 margin_per_contract, hedge_mode, do_rebalance, rebalance_long_target,
                  cost_fee, cost_tax, cost_slippage, include_costs):
     
     df = df_data.copy()
@@ -149,15 +149,110 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
             idx_ret = (price_taiex - prev_taiex) / prev_taiex
             
             if position == 1:
-                # Determine Notional
-                max_short_notional = current_short_capital * short_leverage
-                if hedge_mode == "完全避險 (Neutral Hedge)":
-                    target_short_notional = long_equity * 2
-                    actual_short_notional = min(target_short_notional, max_short_notional)
-                else:
-                    actual_short_notional = max_short_notional
+                # Determine Contracts based on Margin
+                # Logic: Contracts = Floor(Short Capital / Margin per Contract)
+                # Note: We use the capital at the START of the trade or rebalance to determine contracts?
+                # To be dynamic, we should use current capital. But usually contracts are fixed until rebalance or signal change.
+                # For this backtest, let's assume we adjust contracts daily? No, that's high friction.
+                # Let's assume we hold the contracts determined at entry or rebalance.
+                # BUT, the previous logic was calculating notional daily.
+                # To keep it simple and consistent with "Dynamic Balancing" concept in the prompt:
+                # "Use the remaining percentage... calculate how many contracts... calculate risk"
+                # If we strictly follow "Short Account has 30%", then:
                 
-                short_pnl = actual_short_notional * (-1 * idx_ret)
+                # We need to know how many contracts we are holding TODAY.
+                # Let's assume we re-calculate contracts only on Signal Change or Rebalance?
+                # Or do we simply calculate: max_contracts = current_short_capital // margin_per_contract
+                # If we do it daily, it means we are compounding/de-compounding daily.
+                # Let's stick to: Calculate contracts based on current capital daily (approximating daily re-adjustment or simply tracking the theoretical exposure)
+                # However, real trading doesn't adjust daily.
+                # Let's use the logic: Contracts are determined at ENTRY.
+                # And if "Monthly Rebalance" is ON, we re-adjust contracts at month start.
+                
+                # Wait, the previous code calculated `actual_short_notional` every day based on `current_short_capital`.
+                # That implies daily compounding/adjustment.
+                # Let's stick to that for consistency, but use integer contracts.
+                
+                max_contracts = int(current_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+                
+                if hedge_mode == "完全避險 (Neutral Hedge)":
+                    # Target Notional = Long Equity * 2
+                    # Target Contracts = Target Notional / (Price * 50)
+                    target_notional = long_equity * 2
+                    target_contracts = int(target_notional / (prev_taiex * 50)) # Use prev price to decide
+                    actual_contracts = min(target_contracts, max_contracts)
+                else:
+                    actual_contracts = max_contracts
+                
+                # Calculate P&L
+                # P&L = Contracts * Points * 50
+                # Points = Change in Index
+                # But wait, if we change contracts daily, we need to account for cost?
+                # The previous code didn't charge cost for daily adjustment, only for signal change.
+                # Let's assume the "Contracts" variable for P&L calculation is based on the position held from previous day.
+                
+                # To avoid complexity of daily re-sizing costs, let's assume we hold the contracts determined at Entry (or Rebalance).
+                # But the user said "Calculate risk indicator...".
+                
+                # Let's simplify:
+                # We use the `current_short_capital` to determine capability.
+                # But for P&L, we should use the contracts we *actually* hold.
+                # Which means we need to track `held_contracts`.
+                
+                # Refined Logic:
+                # 1. On Signal Entry: Calculate contracts = Capital // Margin. Open position.
+                # 2. On Monthly Rebalance: Close and Re-open (re-calc contracts).
+                # 3. Daily: P&L = held_contracts * (Price_diff) * 50.
+                
+                # However, implementing "held_contracts" state requires more change.
+                # The previous code was: `short_pnl = actual_short_notional * (-1 * idx_ret)`
+                # This is "Continuous Compounding" (Daily Rebalancing).
+                # If I change to "Integer Contracts", I should probably stick to the "Daily Re-eval" for the backtest loop to be simple,
+                # OR properly implement state.
+                # Given the user's request "Use 85000 to hedge... calculate how many contracts",
+                # it sounds like they want to see the discrete contract number.
+                
+                # Let's try to be robust:
+                # If we are IN A TRADE (Position=1), we have `current_contracts`.
+                # We only update `current_contracts` if we Rebalance.
+                pass # Logic handled below in the loop structure
+            
+            # We need to handle the P&L *before* we decide new contracts for tomorrow?
+            # No, we calculate P&L based on *yesterday's* decision.
+            
+            # Let's look at how `trades` are recorded. They use `entry_capital`.
+            # Let's stick to the previous structure but replace Notional with Contracts.
+            
+            # RE-DESIGNING THE LOOP FOR INTEGER CONTRACTS
+            # This is a bit of a change from the "Continuous" model.
+            
+            # Let's use a simplified approach that mimics the previous one but with steps:
+            # Daily P&L is based on the "Effective Notional" of the contracts we *would* hold.
+            # max_contracts = int(current_short_capital / margin_per_contract)
+            # actual_notional = max_contracts * prev_taiex * 50
+            # short_pnl = actual_notional * (-1 * idx_ret)
+            
+            # This effectively simulates daily rebalancing of contracts (without cost).
+            # It's a fair approximation for a "Strategy Backtest" unless we want to be very strict about costs.
+            # The previous code `actual_short_notional = min(..., ...)` also implied daily adjustment.
+            
+            max_contracts = int(current_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+            
+            if hedge_mode == "完全避險 (Neutral Hedge)":
+                target_notional = long_equity * 2
+                # Use prev_taiex to determine contracts needed at start of day
+                target_contracts = int(target_notional / (prev_taiex * 50))
+                actual_contracts = min(target_contracts, max_contracts)
+            else:
+                actual_contracts = max_contracts
+            
+            # Calculate P&L for this day
+            # P&L = Contracts * (Price - Prev_Price) * 50 * (-1)
+            # Short: (Prev - Curr) * 50 * Contracts
+            daily_points_change = price_taiex - prev_taiex
+            short_pnl = actual_contracts * daily_points_change * 50 * (-1)
+            
+            if position == 1:
                 current_short_capital += short_pnl
                 total_short_pnl += short_pnl
         
@@ -167,24 +262,21 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
         
         if position != prev_pos:
             # Calculate Contracts for Cost
-            # Note: This is an approximation. Ideally we calculate contracts based on the capital at that moment.
-            # For simplicity, we use the capital at the beginning of the day/period logic
+            # We need to know how many contracts we are opening/closing.
+            # For simplicity in this "Daily Rebalance" approximation, we charge cost on the *current* target contracts.
             
-            max_short_notional = current_short_capital * short_leverage
+            max_contracts = int(current_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+            
             if hedge_mode == "完全避險 (Neutral Hedge)":
-                target_short_notional = long_equity * 2
-                actual_short_notional = min(target_short_notional, max_short_notional)
+                target_notional = long_equity * 2
+                target_contracts = int(target_notional / (price_taiex * 50))
+                actual_contracts = min(target_contracts, max_contracts)
             else:
-                actual_short_notional = max_short_notional
+                actual_contracts = max_contracts
             
-            contracts = actual_short_notional / (price_taiex * 50) if price_taiex > 0 else 0
+            contracts = actual_contracts
             
             if contracts > 0 and include_costs:
-                # Cost = Tax + Fee + Slippage
-                # Tax: price * 50 * contracts * tax_rate
-                # Fee: contracts * fee
-                # Slippage: contracts * slippage_points * 50
-                
                 trade_tax = price_taiex * 50 * contracts * cost_tax
                 trade_fee = contracts * cost_fee
                 trade_slippage = contracts * cost_slippage * 50
@@ -209,18 +301,21 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
                 points_diff = entry_price - exit_price
                 ret = (entry_price - exit_price) / entry_price
                 
-                # Re-calc contracts for record
-                # (Using entry values for consistency with display)
-                max_short_notional_entry = entry_capital * short_leverage
+                # Re-calc contracts for record (Entry Snapshot)
+                max_contracts_entry = int(entry_capital / margin_per_contract) if margin_per_contract > 0 else 0
                 if hedge_mode == "完全避險 (Neutral Hedge)":
-                    target_short_notional_entry = entry_long_equity * 2
-                    actual_short_notional_entry = min(target_short_notional_entry, max_short_notional_entry)
+                    target_notional_entry = entry_long_equity * 2
+                    target_contracts_entry = int(target_notional_entry / (entry_price * 50))
+                    actual_contracts_entry = min(target_contracts_entry, max_contracts_entry)
                 else:
-                    actual_short_notional_entry = max_short_notional_entry
+                    actual_contracts_entry = max_contracts_entry
                 
-                contracts_entry = actual_short_notional_entry / (entry_price * 50)
+                contracts_entry = actual_contracts_entry
                 profit_twd = points_diff * 50 * contracts_entry
-                eff_leverage = actual_short_notional_entry / entry_capital if entry_capital > 0 else 0
+                
+                # Effective Leverage = Notional / Capital
+                entry_notional = contracts_entry * entry_price * 50
+                eff_leverage = entry_notional / entry_capital if entry_capital > 0 else 0
                 
                 trades.append({
                     '進場日期': entry_date, '進場指數': entry_price,
@@ -257,16 +352,19 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
         points_diff = entry_price - current_price
         ret = (entry_price - current_price) / entry_price
         
-        max_short_notional_entry = entry_capital * short_leverage
+        max_contracts_entry = int(entry_capital / margin_per_contract) if margin_per_contract > 0 else 0
         if hedge_mode == "完全避險 (Neutral Hedge)":
-            target_short_notional_entry = entry_long_equity * 2
-            actual_short_notional_entry = min(target_short_notional_entry, max_short_notional_entry)
+            target_notional_entry = entry_long_equity * 2
+            target_contracts_entry = int(target_notional_entry / (entry_price * 50))
+            actual_contracts_entry = min(target_contracts_entry, max_contracts_entry)
         else:
-            actual_short_notional_entry = max_short_notional_entry
+            actual_contracts_entry = max_contracts_entry
             
-        contracts_entry = actual_short_notional_entry / (entry_price * 50)
+        contracts_entry = actual_contracts_entry
         profit_twd = points_diff * 50 * contracts_entry
-        eff_leverage = actual_short_notional_entry / entry_capital if entry_capital > 0 else 0
+        
+        entry_notional = contracts_entry * entry_price * 50
+        eff_leverage = entry_notional / entry_capital if entry_capital > 0 else 0
         
         trades.append({
             '進場日期': entry_date, '進場指數': entry_price,
@@ -407,12 +505,14 @@ if df is not None:
     st.sidebar.write(f"初始做多部位 (00631L): {long_allocation_pct*100}%")
     st.sidebar.write(f"初始做空部位 (小台): {short_allocation_pct*100}%")
 
-    short_leverage = st.sidebar.slider("小台做空槓桿倍數 (最大資金倍數)", min_value=1.0, max_value=10.0, value=5.0, step=0.1, help="設定小台做空時的『最大』槓桿倍數。")
+    # Removed short_leverage slider
+    
+    margin_per_contract = st.sidebar.number_input("小台單口保證金 (TWD)", value=85000, step=1000)
 
     hedge_mode = st.sidebar.radio(
         "避險策略模式",
         ("積極做空 (Aggressive)", "完全避險 (Neutral Hedge)"),
-        help="積極做空：使用所有可用資金 x 槓桿倍數進行放空 (可能變成淨空單)。\n完全避險：僅放空與 00631L 曝險等值 (2倍市值) 的部位，追求市場中性。"
+        help="積極做空：使用所有可用做空資金 / 保證金 = 最大口數。\n完全避險：口數上限為對沖 00631L 曝險 (2倍市值)，但不超過資金可承作口數。"
     )
 
     do_rebalance = st.sidebar.checkbox("啟用每月動態平衡 (Monthly Rebalancing)", value=True, help="每月初將資金重新分配，以解決資產增長後避險不足的問題。")
@@ -429,8 +529,8 @@ if df is not None:
     cost_slippage = st.sidebar.number_input("滑價 (點數)", value=1, step=1)
     include_costs = st.sidebar.checkbox("是否計入交易成本", value=True)
     
-    st.sidebar.subheader("風險控管設定")
-    margin_per_contract = st.sidebar.number_input("小台單口保證金 (TWD)", value=85000, step=1000)
+    # st.sidebar.subheader("風險控管設定") 
+    # Moved margin_per_contract up
 
     # Date Range Filter
     if df.empty:
@@ -459,7 +559,7 @@ if df is not None:
         # --- Run Backtest ---
         df_test, trades, total_long_pnl, total_short_pnl, total_cost = run_backtest(
             df_test_raw, ma_period, initial_capital, long_allocation_pct, short_allocation_pct,
-            short_leverage, hedge_mode, do_rebalance, rebalance_long_target,
+            margin_per_contract, hedge_mode, do_rebalance, rebalance_long_target,
             cost_fee, cost_tax, cost_slippage, include_costs
         )
         
@@ -539,21 +639,24 @@ if df is not None:
                     entry_long_equity = entry_row['Long_Equity']
                     entry_price_00631L = entry_row['00631L']
                     
-                    # Calculate Notional
-                    max_short_notional = entry_short_capital * short_leverage
+                    # Calculate Contracts
+                    max_contracts = int(entry_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
                     if hedge_mode == "完全避險 (Neutral Hedge)":
-                        target_short_notional = entry_long_equity * 2
-                        actual_short_notional = min(target_short_notional, max_short_notional)
+                        target_notional = entry_long_equity * 2
+                        target_contracts = int(target_notional / (entry_price * 50))
+                        actual_contracts = min(target_contracts, max_contracts)
                     else:
-                        actual_short_notional = max_short_notional
+                        actual_contracts = max_contracts
                         
-                    contracts = actual_short_notional / (entry_price * 50)
+                    contracts = actual_contracts
                     
                     # Current Short P&L
                     points_diff = entry_price - last_close
                     profit_twd = points_diff * 50 * contracts
                     ret = (entry_price - last_close) / entry_price
-                    eff_leverage = actual_short_notional / entry_short_capital if entry_short_capital > 0 else 0
+                    
+                    entry_notional = contracts * entry_price * 50
+                    eff_leverage = entry_notional / entry_short_capital if entry_short_capital > 0 else 0
                     roi = ret * eff_leverage
                     
                     # Current 00631L P&L
@@ -570,7 +673,7 @@ if df is not None:
                     with col_h1:
                         st.markdown("#### 🐻 小台 (空單)")
                         st.write(f"**進場日期**：{entry_date.strftime('%Y-%m-%d')}")
-                        st.write(f"**避險口數**：{contracts:.2f} 口")
+                        st.write(f"**避險口數**：{contracts} 口")
                         st.metric("進場指數", f"{entry_price:,.0f}")
                         st.metric("目前指數", f"{last_close:,.0f}", delta=f"{last_close - entry_price:,.0f}", delta_color="inverse")
                         st.metric("空單損益 (TWD)", f"{profit_twd:,.0f}", delta=f"{roi:.2%}")
@@ -591,7 +694,7 @@ if df is not None:
                         
                         # Vertical Stack for better visibility
                         st.metric("做空帳戶資金 (權益數)", f"{current_short_equity_val:,.0f}")
-                        st.metric("所需保證金", f"{required_margin:,.0f}", help=f"口數 {contracts:.2f} x 保證金 {margin_per_contract:,.0f}")
+                        st.metric("所需保證金", f"{required_margin:,.0f}", help=f"口數 {contracts} x 保證金 {margin_per_contract:,.0f}")
                         
                         # Risk Ratio
                         st.markdown(f"**風險指標 (目標 > 300%)**")
