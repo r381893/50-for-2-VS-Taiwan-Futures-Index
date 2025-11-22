@@ -4,6 +4,8 @@ import plotly.graph_objects as go
 import numpy as np
 import os
 import yfinance as yf
+import json
+
 
 st.set_page_config(page_title="台灣五十正2 & 小台 Backtest", layout="wide")
 
@@ -173,13 +175,16 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
                 # That implies daily compounding/adjustment.
                 # Let's stick to that for consistency, but use integer contracts.
                 
-                max_contracts = int(current_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+                # Risk Control: Ensure Risk Indicator >= 300% (Equity >= 3 * Margin)
+                # Max Contracts = Equity / (3 * Margin)
+                safe_margin_factor = 3.0
+                max_contracts = int(current_short_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
                 
                 if hedge_mode == "完全避險 (Neutral Hedge)":
                     # Target Notional = Long Equity * 2
                     # Target Contracts = Target Notional / (Price * 50)
                     target_notional = long_equity * 2
-                    target_contracts = int(target_notional / (prev_taiex * 50)) # Use prev price to decide
+                    target_contracts = int(round(target_notional / (prev_taiex * 50))) # Use round to be closer to target
                     actual_contracts = min(target_contracts, max_contracts)
                 else:
                     actual_contracts = max_contracts
@@ -236,12 +241,14 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
             # It's a fair approximation for a "Strategy Backtest" unless we want to be very strict about costs.
             # The previous code `actual_short_notional = min(..., ...)` also implied daily adjustment.
             
-            max_contracts = int(current_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+            # Risk Control: Ensure Risk Indicator >= 300%
+            safe_margin_factor = 3.0
+            max_contracts = int(current_short_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
             
             if hedge_mode == "完全避險 (Neutral Hedge)":
                 target_notional = long_equity * 2
                 # Use prev_taiex to determine contracts needed at start of day
-                target_contracts = int(target_notional / (prev_taiex * 50))
+                target_contracts = int(round(target_notional / (prev_taiex * 50)))
                 actual_contracts = min(target_contracts, max_contracts)
             else:
                 actual_contracts = max_contracts
@@ -265,11 +272,13 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
             # We need to know how many contracts we are opening/closing.
             # For simplicity in this "Daily Rebalance" approximation, we charge cost on the *current* target contracts.
             
-            max_contracts = int(current_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+            # Risk Control: Ensure Risk Indicator >= 300%
+            safe_margin_factor = 3.0
+            max_contracts = int(current_short_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
             
             if hedge_mode == "完全避險 (Neutral Hedge)":
                 target_notional = long_equity * 2
-                target_contracts = int(target_notional / (price_taiex * 50))
+                target_contracts = int(round(target_notional / (price_taiex * 50)))
                 actual_contracts = min(target_contracts, max_contracts)
             else:
                 actual_contracts = max_contracts
@@ -302,10 +311,12 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
                 ret = (entry_price - exit_price) / entry_price
                 
                 # Re-calc contracts for record (Entry Snapshot)
-                max_contracts_entry = int(entry_capital / margin_per_contract) if margin_per_contract > 0 else 0
+                # Re-calc contracts for record (Entry Snapshot)
+                safe_margin_factor = 3.0
+                max_contracts_entry = int(entry_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
                 if hedge_mode == "完全避險 (Neutral Hedge)":
                     target_notional_entry = entry_long_equity * 2
-                    target_contracts_entry = int(target_notional_entry / (entry_price * 50))
+                    target_contracts_entry = int(round(target_notional_entry / (entry_price * 50)))
                     actual_contracts_entry = min(target_contracts_entry, max_contracts_entry)
                 else:
                     actual_contracts_entry = max_contracts_entry
@@ -352,10 +363,11 @@ def run_backtest(df_data, ma_period, initial_capital, long_allocation_pct, short
         points_diff = entry_price - current_price
         ret = (entry_price - current_price) / entry_price
         
-        max_contracts_entry = int(entry_capital / margin_per_contract) if margin_per_contract > 0 else 0
+        safe_margin_factor = 3.0
+        max_contracts_entry = int(entry_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
         if hedge_mode == "完全避險 (Neutral Hedge)":
             target_notional_entry = entry_long_equity * 2
-            target_contracts_entry = int(target_notional_entry / (entry_price * 50))
+            target_contracts_entry = int(round(target_notional_entry / (entry_price * 50)))
             actual_contracts_entry = min(target_contracts_entry, max_contracts_entry)
         else:
             actual_contracts_entry = max_contracts_entry
@@ -500,10 +512,19 @@ if df is not None:
 
     # Strategy Allocation
     st.sidebar.subheader("資金分配與策略")
-    long_allocation_pct = 0.5
-    short_allocation_pct = 0.5
-    st.sidebar.write(f"初始做多部位 (00631L): {long_allocation_pct*100}%")
-    st.sidebar.write(f"初始做空部位 (小台): {short_allocation_pct*100}%")
+    
+    do_rebalance = st.sidebar.checkbox("啟用每月動態平衡 (Monthly Rebalancing)", value=True, help="每月初將資金重新分配，以解決資產增長後避險不足的問題。")
+
+    if do_rebalance:
+        rebalance_long_target = st.sidebar.slider("動態平衡：做多部位目標比例 (%)", min_value=10, max_value=100, value=90, step=5) / 100.0
+        long_allocation_pct = rebalance_long_target # Sync initial with target
+    else:
+        rebalance_long_target = 0.5
+        long_allocation_pct = 0.5
+
+    short_allocation_pct = 1 - long_allocation_pct
+    st.sidebar.write(f"初始做多部位 (00631L): {long_allocation_pct*100:.0f}%")
+    st.sidebar.write(f"初始做空部位 (小台): {short_allocation_pct*100:.0f}%")
 
     # Removed short_leverage slider
     
@@ -512,15 +533,11 @@ if df is not None:
     hedge_mode = st.sidebar.radio(
         "避險策略模式",
         ("積極做空 (Aggressive)", "完全避險 (Neutral Hedge)"),
-        help="積極做空：使用所有可用做空資金 / 保證金 = 最大口數。\n完全避險：口數上限為對沖 00631L 曝險 (2倍市值)，但不超過資金可承作口數。"
+        index=1, # Default to Neutral
+        help="積極做空：使用可用做空資金，但限制風險指標不低於 300%。\n完全避險：口數上限為對沖 00631L 曝險 (2倍市值)，且受風險指標 300% 限制。"
     )
 
-    do_rebalance = st.sidebar.checkbox("啟用每月動態平衡 (Monthly Rebalancing)", value=True, help="每月初將資金重新分配，以解決資產增長後避險不足的問題。")
-
-    if do_rebalance:
-        rebalance_long_target = st.sidebar.slider("動態平衡：做多部位目標比例 (%)", min_value=10, max_value=90, value=70, step=5) / 100.0
-    else:
-        rebalance_long_target = 0.5
+    # do_rebalance moved up
     
     # Transaction Costs
     st.sidebar.subheader("交易成本設定")
@@ -564,7 +581,7 @@ if df is not None:
         )
         
         # --- Tabs ---
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 總覽", "📈 績效分析", "📅 週期分析", "📋 交易明細", "🔭 最新訊號判斷", "🎯 參數敏感度"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 總覽", "📈 績效分析", "📅 週期分析", "📋 交易明細", "🔭 最新訊號判斷", "🎯 參數敏感度", "🎮 真實操作模擬"])
 
         # --- Tab 5: Latest Signal ---
         with tab5:
@@ -640,10 +657,11 @@ if df is not None:
                     entry_price_00631L = entry_row['00631L']
                     
                     # Calculate Contracts
-                    max_contracts = int(entry_short_capital / margin_per_contract) if margin_per_contract > 0 else 0
+                    safe_margin_factor = 3.0
+                    max_contracts = int(entry_short_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
                     if hedge_mode == "完全避險 (Neutral Hedge)":
                         target_notional = entry_long_equity * 2
-                        target_contracts = int(target_notional / (entry_price * 50))
+                        target_contracts = int(round(target_notional / (entry_price * 50)))
                         actual_contracts = min(target_contracts, max_contracts)
                     else:
                         actual_contracts = max_contracts
@@ -988,6 +1006,129 @@ if df is not None:
                 """)
                 
                 st.success("分析完成！")
+
+        with tab7:
+            st.subheader("🎮 真實操作模擬 (Real-world Simulation)")
+            st.info("在此輸入您目前的實際資產狀況，系統將根據策略邏輯提供操作建議。")
+            
+            # Load Settings
+            SETTINGS_FILE = "user_simulation_settings.json"
+            default_settings = {
+                "shares_00631L": 1000,
+                "short_capital": 100000,
+                "held_contracts": 0
+            }
+            
+            if os.path.exists(SETTINGS_FILE):
+                try:
+                    with open(SETTINGS_FILE, "r") as f:
+                        saved_settings = json.load(f)
+                        default_settings.update(saved_settings)
+                except:
+                    pass
+
+            col_real_1, col_real_2 = st.columns(2)
+            
+            with col_real_1:
+                st.markdown("#### 1. 輸入目前資產狀況")
+                
+                # Input Shares instead of Value
+                real_shares_00631L = st.number_input("目前 00631L 持有股數 (Shares)", value=default_settings["shares_00631L"], step=1000)
+                real_short_capital = st.number_input("目前 期貨保證金專戶餘額 (權益數 TWD)", value=default_settings["short_capital"], step=10000)
+                real_held_contracts = st.number_input("目前 持有小台口數 (空單)", value=default_settings["held_contracts"], step=1)
+                
+                # Save Settings Button (Implicit or Explicit? Let's do auto-save on change if possible, but Streamlit re-runs. 
+                # Let's save at the end of the script or just save now)
+                current_settings = {
+                    "shares_00631L": real_shares_00631L,
+                    "short_capital": real_short_capital,
+                    "held_contracts": real_held_contracts
+                }
+                if current_settings != default_settings:
+                    with open(SETTINGS_FILE, "w") as f:
+                        json.dump(current_settings, f)
+                
+                st.markdown("#### 2. 確認市場數據 (預設為最新)")
+                sim_last_close = st.number_input("加權指數收盤價", value=float(last_close), step=10.0)
+                sim_ma = st.number_input(f"目前 {ma_period}MA", value=float(last_ma), step=10.0)
+                
+                # Auto-calc Value
+                sim_price_00631L = last_00631L # Use latest from data
+                real_long_value = real_shares_00631L * sim_price_00631L
+                st.info(f"ℹ️ 00631L 目前參考價: {sim_price_00631L:.2f} | 推算市值: {real_long_value:,.0f} TWD")
+                
+
+                
+            with col_real_2:
+                st.markdown("#### 3. 策略運算結果")
+                
+                # Logic
+                sim_is_bearish = sim_last_close < sim_ma
+                sim_signal_text = "空方 (跌破均線)" if sim_is_bearish else "多方 (站上均線)"
+                sim_signal_color = "red" if not sim_is_bearish else "green"
+                
+                st.markdown(f"**目前訊號**：<span style='color:{sim_signal_color};font-weight:bold'>{sim_signal_text}</span>", unsafe_allow_html=True)
+                
+                # Signal Details
+                diff_points = sim_last_close - sim_ma
+                if sim_is_bearish:
+                    st.caption(f"📉 指數 ({sim_last_close:,.0f}) 低於 {ma_period}MA ({sim_ma:,.0f}) 共 {abs(diff_points):,.0f} 點")
+                else:
+                    st.caption(f"📈 指數 ({sim_last_close:,.0f}) 高於 {ma_period}MA ({sim_ma:,.0f}) 共 {abs(diff_points):,.0f} 點")
+                
+                # Calculate Target Contracts
+                # Risk Limit
+                safe_margin_factor = 3.0
+                sim_max_contracts = int(real_short_capital / (safe_margin_factor * margin_per_contract)) if margin_per_contract > 0 else 0
+                
+                if sim_is_bearish:
+                    if hedge_mode == "完全避險 (Neutral Hedge)":
+                        sim_target_notional = real_long_value * 2
+                        sim_target_contracts_raw = int(round(sim_target_notional / (sim_last_close * 50)))
+                        sim_target_contracts = min(sim_target_contracts_raw, sim_max_contracts)
+                        hedge_reason = f"對沖 2倍市值 (目標 {sim_target_contracts_raw} 口)，受資金/風險限制"
+                    else: # Aggressive
+                        sim_target_contracts = sim_max_contracts
+                        hedge_reason = "積極做空 (資金允許最大口數，風險指標 >= 300%)"
+                else:
+                    sim_target_contracts = 0
+                    hedge_reason = "多方趨勢，不需避險"
+                
+                # Action
+                diff_contracts = sim_target_contracts - real_held_contracts
+                
+                if diff_contracts > 0:
+                    action_msg = f"🔴 加空 {diff_contracts} 口"
+                    action_desc = f"目前持有 {real_held_contracts} 口，目標 {sim_target_contracts} 口"
+                elif diff_contracts < 0:
+                    action_msg = f"🟢 回補 {abs(diff_contracts)} 口"
+                    action_desc = f"目前持有 {real_held_contracts} 口，目標 {sim_target_contracts} 口"
+                else:
+                    action_msg = "⚪ 維持現狀"
+                    action_desc = f"目前持有 {real_held_contracts} 口，符合目標"
+                
+                st.metric("建議操作", action_msg, help=action_desc)
+                st.write(f"**目標口數**：{sim_target_contracts} 口")
+                st.write(f"**策略邏輯**：{hedge_reason}")
+                
+                st.divider()
+                
+                # Risk Preview
+                st.markdown("#### ⚠️ 調整後風險預估")
+                sim_required_margin = sim_target_contracts * margin_per_contract
+                if sim_required_margin > 0:
+                    sim_risk_ratio = real_short_capital / sim_required_margin
+                else:
+                    sim_risk_ratio = 999
+                
+                sim_risk_color = "red" if sim_risk_ratio < 3.0 else "green"
+                st.metric("預估風險指標", f"{sim_risk_ratio:.0%}", delta="目標 > 300%")
+                if sim_risk_ratio < 3.0 and sim_target_contracts > 0:
+                    st.warning("⚠️ 注意：即使調整後，風險指標仍低於 300%，建議補錢或減少口數。")
+                elif sim_target_contracts == 0:
+                    st.success("目前無部位，無風險。")
+                else:
+                    st.success("風險指標安全。")
 
 else:
     st.info("請上傳 00631L 和 加權指數 的 Excel 檔案，或確認目錄下是否有預設檔案。")
