@@ -508,7 +508,14 @@ except Exception as e:
 if df is not None:
     # Sidebar Parameters
     initial_capital = st.sidebar.number_input("初始總資金 (TWD)", value=1000000, step=100000)
-    ma_period = st.sidebar.number_input("加權指數均線週期 (MA)", value=13, step=1)
+    if 'ma_period' not in st.session_state:
+        st.session_state['ma_period'] = 13
+
+    ma_period = st.sidebar.number_input("加權指數均線週期 (MA)", value=st.session_state['ma_period'], step=1, key='ma_input')
+    
+    # Sync session state if changed manually
+    if ma_period != st.session_state['ma_period']:
+        st.session_state['ma_period'] = ma_period
 
     # Strategy Allocation
     st.sidebar.subheader("資金分配與策略")
@@ -832,7 +839,13 @@ if df is not None:
             st.subheader("回撤曲線 (Drawdown)")
             fig_dd = go.Figure()
             fig_dd.add_trace(go.Scatter(x=drawdown.index, y=drawdown, fill='tozeroy', line=dict(color='red'), name='回撤'))
-            fig_dd.update_layout(title='總資產回撤幅度', yaxis_title='回撤 %', hovermode="x unified", template="plotly_white")
+            fig_dd.update_layout(
+                title='總資產回撤幅度', 
+                yaxis_title='回撤 %', 
+                hovermode="x unified", 
+                template="plotly_white",
+                yaxis=dict(tickformat=".0%")
+            )
             st.plotly_chart(fig_dd, use_container_width=True)
 
         with tab3:
@@ -845,9 +858,9 @@ if df is not None:
             })
             
             yearly_ret = pd.DataFrame()
-            yearly_ret['總資產報酬率'] = (yearly_stats['Total_Equity']['last'] - yearly_stats['Total_Equity']['first']) / yearly_stats['Total_Equity']['first']
-            yearly_ret['Benchmark 報酬率'] = (yearly_stats['Benchmark']['last'] - yearly_stats['Benchmark']['first']) / yearly_stats['Benchmark']['first']
-            yearly_ret['超額報酬 (Alpha)'] = yearly_ret['總資產報酬率'] - yearly_ret['Benchmark 報酬率']
+            yearly_ret['年化報酬率'] = ((yearly_stats['Total_Equity']['last'] - yearly_stats['Total_Equity']['first']) / yearly_stats['Total_Equity']['first']) * 100
+            yearly_ret['Benchmark 報酬率'] = ((yearly_stats['Benchmark']['last'] - yearly_stats['Benchmark']['first']) / yearly_stats['Benchmark']['first']) * 100
+            yearly_ret['超額報酬 (Alpha)'] = yearly_ret['年化報酬率'] - yearly_ret['Benchmark 報酬率']
             
             # Yearly MDD
             yearly_mdd = []
@@ -855,19 +868,40 @@ if df is not None:
                 df_year = df_test[df_test['Year'] == year]
                 eq = df_year['Total_Equity']
                 dd = (eq - eq.cummax()) / eq.cummax()
-                yearly_mdd.append(dd.min())
+                yearly_mdd.append(dd.min() * 100)
             yearly_ret['策略最大回撤 (MDD)'] = yearly_mdd
             
+            # Add Average Row
+            avg_row = yearly_ret.mean()
+            yearly_ret.loc['平均值 (Avg)'] = avg_row
+            
+            def highlight_average(row):
+                if row.name == '平均值 (Avg)':
+                    return ['background-color: #fff8e1; color: #bf360c; font-weight: bold'] * len(row)
+                return [''] * len(row)
+            
             st.dataframe(
-                yearly_ret,
+                yearly_ret.style.apply(highlight_average, axis=1).format("{:.2f} %"),
                 use_container_width=True,
                 column_config={
-                    "總資產報酬率": st.column_config.NumberColumn(format="%.2f %%"),
+                    "年化報酬率": st.column_config.NumberColumn(format="%.2f %%"),
                     "Benchmark 報酬率": st.column_config.NumberColumn(format="%.2f %%"),
                     "超額報酬 (Alpha)": st.column_config.NumberColumn(format="%.2f %%"),
-                    "策略最大回撤 (MDD)": st.column_config.ProgressColumn(format="%.2f %%", min_value=-0.5, max_value=0),
+                    "策略最大回撤 (MDD)": st.column_config.ProgressColumn(format="%.2f %%", min_value=-100, max_value=0),
                 }
             )
+            
+            st.markdown("""
+            <div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; font-size: 0.9em; color: #555;">
+            <b>指標說明：</b>
+            <ul style="margin-bottom: 0;">
+                <li><b>年化報酬率</b>: 策略在該年度的總投資報酬率 (Total Return)</li>
+                <li><b>Benchmark 報酬率</b>: 單純買進持有 00631L (Buy & Hold) 的年度報酬率</li>
+                <li><b>超額報酬 (Alpha)</b>: 策略報酬率減去 Benchmark 報酬率的差額，正值代表跑贏大盤</li>
+                <li><b>策略最大回撤 (MDD)</b>: 該年度策略資產從最高點回落的最大幅度 (風險指標)</li>
+            </ul>
+            </div>
+            """, unsafe_allow_html=True)
             
             st.subheader("月度報酬率分析 (總資產)")
             df_test['Month'] = df_test.index.to_period('M')
@@ -901,6 +935,36 @@ if df is not None:
                                       '獲利點數': '{:,.0f}', '獲利金額 (TWD)': '{:,.0f}', '報酬率': '{:.2%}'}),
                              use_container_width=True)
                 
+                # Annual Short P&L Summary
+                st.divider()
+                st.subheader("📅 每年做空避險損益統計")
+                
+                df_trades_raw = pd.DataFrame(trades)
+                df_trades_raw['Year'] = pd.to_datetime(df_trades_raw['出場日期']).dt.year
+                annual_short_pnl = df_trades_raw.groupby('Year')['獲利金額 (TWD)'].sum().reset_index()
+                annual_short_pnl.columns = ['年份', '做空總損益 (TWD)']
+                
+                # Add Trade Count per year
+                annual_counts = df_trades_raw.groupby('Year').size().reset_index(name='交易次數')
+                annual_counts.columns = ['年份', '交易次數'] # Rename explicitly
+                annual_summary = pd.merge(annual_short_pnl, annual_counts, on='年份')
+                
+                # Calculate Average P&L per trade
+                annual_summary['平均單筆損益'] = annual_summary['做空總損益 (TWD)'] / annual_summary['交易次數']
+                
+                def color_annual_pnl(val):
+                    color = 'red' if val > 0 else 'green'
+                    return f'color: {color}'
+
+                st.dataframe(
+                    annual_summary.style.applymap(color_annual_pnl, subset=['做空總損益 (TWD)', '平均單筆損益'])
+                    .format({'年份': '{:d}', '做空總損益 (TWD)': '{:,.0f}', '平均單筆損益': '{:,.0f}'}),
+                    use_container_width=True,
+                    column_config={
+                        "年份": st.column_config.NumberColumn("年份", format="%d"),
+                    }
+                )
+                
                 # Export Buttons
                 st.divider()
                 st.subheader("📥 資料匯出")
@@ -926,7 +990,16 @@ if df is not None:
 
         with tab6:
             st.subheader("🎯 參數敏感度分析 (MA Sensitivity)")
-            st.info("此功能將測試不同均線週期對策略績效的影響。")
+            
+            # Show Date Range Context
+            if not df_test_raw.empty:
+                sa_start_date = df_test_raw.index.min().date()
+                sa_end_date = df_test_raw.index.max().date()
+                sa_days = (sa_end_date - sa_start_date).days
+                sa_years = sa_days / 365.25
+                st.info(f"此功能將測試不同均線週期對策略績效的影響。\n\n**目前回測區間**：{sa_start_date} ~ {sa_end_date} (約 {sa_years:.1f} 年)")
+            else:
+                st.info("此功能將測試不同均線週期對策略績效的影響。")
             
             col_sa1, col_sa2 = st.columns(2)
             ma_start = col_sa1.number_input("MA 起始", value=5, step=1)
@@ -943,7 +1016,7 @@ if df is not None:
                     # Run Backtest (Silent)
                     _df, _trades, _lp, _sp, _cost = run_backtest(
                         df_test_raw, ma, initial_capital, long_allocation_pct, short_allocation_pct,
-                        short_leverage, hedge_mode, do_rebalance, rebalance_long_target,
+                        margin_per_contract, hedge_mode, do_rebalance, rebalance_long_target,
                         cost_fee, cost_tax, cost_slippage, include_costs
                     )
                     
@@ -962,40 +1035,65 @@ if df is not None:
                 
                 df_sa = pd.DataFrame(results)
                 
-                # Visualization
-                st.subheader("報酬率 vs. 均線週期")
-                fig_sa_ret = go.Figure(go.Bar(
+                # Find Best Parameter
+                best_row = df_sa.loc[df_sa['Return'].idxmax()]
+                best_ma = int(best_row['MA'])
+                best_ret = best_row['Return']
+                
+                st.success(f"**最佳均線天數：{best_ma}**，累積報酬率：{best_ret:.2%}")
+                
+                # Benchmark Return
+                benchmark_start = df_test_raw['00631L'].iloc[0]
+                benchmark_end = df_test_raw['00631L'].iloc[-1]
+                benchmark_ret = (benchmark_end - benchmark_start) / benchmark_start
+                
+                st.markdown(f"""
+                <div style="background-color: #e3f2fd; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+                    <strong>📊 績效對照：</strong>
+                    <ul>
+                        <li><strong>策略最佳報酬率</strong>: {best_ret:.2%} (MA={best_ma})</li>
+                        <li><strong>00631L (Buy & Hold) 報酬率</strong>: {benchmark_ret:.2%}</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if st.button(f"套用最佳參數 (MA={best_ma})"):
+                    st.session_state['ma_period'] = best_ma
+                    st.rerun()
+                
+                # Visualization (Line Chart)
+                st.subheader("不同均線天數累積報酬率")
+                fig_sa_ret = go.Figure()
+                fig_sa_ret.add_trace(go.Scatter(
                     x=df_sa['MA'],
                     y=df_sa['Return'],
-                    marker_color=df_sa['Return'],
-                    marker_colorscale='RdBu',
-                    name='Return'
+                    mode='lines+markers',
+                    name='累積報酬率',
+                    line=dict(width=3)
                 ))
-                fig_sa_ret.update_layout(xaxis_title="MA Period", yaxis_title="Return", template="plotly_white")
+                fig_sa_ret.update_layout(
+                    xaxis_title="均線天數", 
+                    yaxis_title="累積報酬率", 
+                    template="plotly_white",
+                    hovermode="x unified"
+                )
                 st.plotly_chart(fig_sa_ret, use_container_width=True)
                 
-                st.info("""
-                **💡 如何解讀報酬率圖表：**
-                *   **X 軸 (MA Period)**：代表不同的均線參數（例如 10 代表 10日線）。
-                *   **Y 軸 (Return)**：代表該參數下的總報酬率。
-                *   **尋找「高原區」**：不要只選最高的那一根柱子（可能是運氣好）。請尋找**連續多根柱子都維持高報酬**的區域（例如 20~30 附近都很高），這代表該參數區間比較穩定，不易失效。
-                """)
+                st.subheader("🏆 績效前五名參數 (Top 5)")
+                top_5 = df_sa.sort_values('Return', ascending=False).head(5).reset_index(drop=True)
+                top_5.index += 1 # Rank 1-based
                 
-                st.subheader("最大回撤 (MDD) vs. 均線週期")
-                fig_sa_mdd = go.Figure(go.Bar(
-                    x=df_sa['MA'],
-                    y=df_sa['MDD'],
-                    marker_color='red',
-                    name='MDD'
-                ))
-                fig_sa_mdd.update_layout(xaxis_title="MA Period", yaxis_title="MDD", template="plotly_white")
-                st.plotly_chart(fig_sa_mdd, use_container_width=True)
-                
-                st.info("""
-                **💡 如何解讀最大回撤圖表：**
-                *   **數值越負，風險越高**：柱子越長（往下延伸），代表歷史上曾經發生的最大虧損幅度越大。
-                *   **尋找「淺水區」**：選擇回撤相對較小（柱子較短）的參數，代表策略在逆風時的防守能力較強。
-                """)
+                # Format as string percentage to ensure integer display
+                top_5['Return_Str'] = top_5['Return'].apply(lambda x: f"{x:.0%}")
+
+                st.dataframe(
+                    top_5[['MA', 'Return_Str']],
+                    use_container_width=True,
+                    column_config={
+                        "MA": st.column_config.NumberColumn("均線天數 (MA)", format="%d"),
+                        "Return_Str": st.column_config.TextColumn("累積報酬率")
+                    }
+                )
                 
                 st.markdown("---")
                 st.markdown("""
