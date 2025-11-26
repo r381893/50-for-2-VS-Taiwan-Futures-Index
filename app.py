@@ -645,8 +645,14 @@ if df is not None:
                     st.write("**目前狀態**：🔴 持有空單中")
                     
                     # Reason for holding short
-                    diff_points = last_ma - last_close
-                    st.markdown(f"📉 **持有原因**：目前指數 ({last_close:,.0f}) 低於 {ma_period}MA ({last_ma:,.0f}) 共 **{diff_points:,.0f}** 點")
+                    if last_close < last_ma:
+                        diff_points = last_ma - last_close
+                        st.markdown(f"📉 **持有原因**：目前指數 ({last_close:,.0f}) 低於 {ma_period}MA ({last_ma:,.0f}) 共 **{diff_points:,.0f}** 點")
+                        st.markdown(f"👉 **後續操作**：續抱空單")
+                    else:
+                        diff_points = last_close - last_ma
+                        st.markdown(f"⚠️ **持有原因**：昨日收盤跌破均線 (目前指數 {last_close:,.0f} 已高於均線 **{diff_points:,.0f}** 點，轉為多方訊號)")
+                        st.markdown(f"👉 **後續操作**：🔴 **應平倉空單** (訊號轉多)")
                     
                     # Find Entry
                     current_trade_entry_index = -1
