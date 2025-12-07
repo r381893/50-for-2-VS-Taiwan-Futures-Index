@@ -413,12 +413,28 @@ try:
         try:
             # Download 00631L
             df_00631L = yf.download("00631L.TW", start="2014-01-01", progress=False)
+            
+            if df_00631L.empty:
+                raise Exception("Yahoo Finance 回傳空資料 (可能被限制存取)")
+
+            # Fix for new yfinance structure (MultiIndex columns)
+            if isinstance(df_00631L.columns, pd.MultiIndex):
+                # If columns are MultiIndex, try to drop the Ticker level
+                df_00631L.columns = df_00631L.columns.droplevel(1)
+            
             df_00631L.reset_index(inplace=True)
             df_00631L = df_00631L[['Date', 'Close']]
             df_00631L.columns = ['Date', '00631L']
             
             # Download TAIEX (^TWII)
             df_taiex = yf.download("^TWII", start="2014-01-01", progress=False)
+
+            if df_taiex.empty:
+                raise Exception("Yahoo Finance 回傳空資料 (可能被限制存取)")
+
+            if isinstance(df_taiex.columns, pd.MultiIndex):
+                df_taiex.columns = df_taiex.columns.droplevel(1)
+
             df_taiex.reset_index(inplace=True)
             df_taiex = df_taiex[['Date', 'Close']]
             df_taiex.columns = ['Date', 'TAIEX']
@@ -431,7 +447,11 @@ try:
             st.sidebar.success(f"下載完成！資料日期：{df.index.min().date()} ~ {df.index.max().date()}")
             
         except Exception as e:
-            st.sidebar.error(f"下載失敗: {e}")
+            st.error(f"下載失敗: {e}")
+            st.warning("Yahoo Finance 可能對您的 IP 進行了速率限制 (Rate Limit)。請稍後再試，或切換至「本地檔案」模式。")
+            if os.path.exists("00631L_2015-2025.xlsx") and os.path.exists("加權指數資料.xlsx"):
+                st.info("💡 偵測到目錄下有本地資料，建議切換至「本地檔案」模式使用。")
+            st.stop()
             
     else: # Local File
         # Check for local files
@@ -559,12 +579,14 @@ if df is not None:
     # Date Range Filter
     if df.empty:
         st.warning("⚠️ 載入的資料為空，請檢查資料來源或日期範圍。")
+        st.stop()
     else:
         min_date = df.index.min()
         max_date = df.index.max()
         
         if pd.isna(min_date) or pd.isna(max_date):
             st.error("⚠️ 資料日期格式錯誤 (NaT)，無法進行回測。")
+            st.stop()
         else:
             start_date, end_date = st.sidebar.date_input(
                 "選擇回測日期範圍",
@@ -816,10 +838,15 @@ if df is not None:
         with tab2:
             st.subheader("績效統計")
             
-            # MDD
+            # MDD (Strategy)
             equity_curve = df_test['Total_Equity']
             drawdown = (equity_curve - equity_curve.cummax()) / equity_curve.cummax()
             max_drawdown = drawdown.min()
+            
+            # MDD (Benchmark - No Hedge)
+            benchmark_curve = df_test['Benchmark']
+            benchmark_drawdown = (benchmark_curve - benchmark_curve.cummax()) / benchmark_curve.cummax()
+            benchmark_max_drawdown = benchmark_drawdown.min()
             
             taiex_curve = df_test['TAIEX']
             taiex_drawdown = (taiex_curve - taiex_curve.cummax()) / taiex_curve.cummax()
@@ -837,20 +864,23 @@ if df is not None:
                 total_trades_count = 0
             
             col_p1, col_p2, col_p3, col_p4 = st.columns(4)
-            with col_p1: metric_card("策略最大回撤 (MDD)", f"{max_drawdown:.2%}", delta_color="inverse")
-            with col_p2: metric_card("大盤最大回撤", f"{taiex_max_drawdown:.2%}", delta_color="inverse")
+            with col_p1: metric_card("策略最大回撤 (含避險)", f"{max_drawdown:.2%}", delta_color="inverse")
+            with col_p2: metric_card("未避險最大回撤 (00631L)", f"{benchmark_max_drawdown:.2%}", delta=f"{benchmark_max_drawdown - max_drawdown:.2%}", delta_color="inverse")
             with col_p3: metric_card("做空交易次數", f"{total_trades_count}")
             with col_p4: metric_card("做空勝率", f"{win_rate:.2%}")
             
             st.subheader("回撤曲線 (Drawdown)")
             fig_dd = go.Figure()
-            fig_dd.add_trace(go.Scatter(x=drawdown.index, y=drawdown, fill='tozeroy', line=dict(color='red'), name='回撤'))
+            fig_dd.add_trace(go.Scatter(x=drawdown.index, y=drawdown, fill='tozeroy', line=dict(color='red'), name='策略回撤 (含避險)'))
+            fig_dd.add_trace(go.Scatter(x=benchmark_drawdown.index, y=benchmark_drawdown, line=dict(color='gray', dash='dot'), name='未避險回撤 (00631L)'))
+            
             fig_dd.update_layout(
-                title='總資產回撤幅度', 
+                title='總資產回撤幅度比較', 
                 yaxis_title='回撤 %', 
                 hovermode="x unified", 
                 template="plotly_white",
-                yaxis=dict(tickformat=".0%")
+                yaxis=dict(tickformat=".0%"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             st.plotly_chart(fig_dd, use_container_width=True)
 
