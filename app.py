@@ -28,6 +28,7 @@ st.markdown("""
     .metric-delta { font-size: 0.9rem; margin-top: 5px; }
     .delta-pos { color: #d32f2f; }
     .delta-neg { color: #388e3c; }
+    .delta-neutral { color: #888888; font-size: 0.8rem; }
     .stTabs [data-baseweb="tab-list"] { gap: 10px; }
     .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 5px; padding: 10px 20px; font-weight: 600; }
     .stTabs [aria-selected="true"] { background-color: #ff4b4b; color: white; }
@@ -38,10 +39,18 @@ def metric_card(label, value, delta=None, delta_color="normal"):
     delta_html = ""
     if delta:
         if delta_color == "inverse":
-            color_class = "delta-neg" if "-" not in str(delta) and float(str(delta).replace(',','').replace('%','')) > 0 else "delta-pos"
+            try:
+                val = float(str(delta).replace(',','').replace('%','').split()[0]) # Try simple parse
+                color_class = "delta-neg" if "-" not in str(delta) and val > 0 else "delta-pos"
+            except:
+                color_class = "delta-neutral"
         else:
-            is_positive = "-" not in str(delta) and float(str(delta).replace(',','').replace('%','')) != 0
-            color_class = "delta-pos" if is_positive else "delta-neg"
+            try:
+                val = float(str(delta).replace(',','').replace('%','').split()[0])
+                is_positive = "-" not in str(delta) and val != 0
+                color_class = "delta-pos" if is_positive else "delta-neg"
+            except:
+                color_class = "delta-neutral" # Fallback for text-only deltas
         delta_html = f'<div class="metric-delta {color_class}">{delta}</div>'
     st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div>{delta_html}</div>', unsafe_allow_html=True)
 
@@ -370,30 +379,37 @@ def render_original_strategy_page(df):
     
     with t1:
         st.subheader("回測結果總覽")
+        
         fin = df_res['Total_Equity'].iloc[-1]
         ret = (fin - initial_capital) / initial_capital
+        
         c1, c2, c3 = st.columns(3)
         with c1: metric_card("期末總資產", f"{fin:,.0f}")
         with c2: metric_card("總報酬率", f"{ret:.2%}", delta=f"{ret:.2%}")
         with c3: metric_card("交易天數", f"{len(df_res)}")
+        
         c4, c5, c6 = st.columns(3)
-        with c4: metric_card("做多總獲利", f"{lp:,.0f}", delta=f"{lp/initial_capital:.1%}")
+        with c4: metric_card("做的總獲利", f"{lp:,.0f}", delta=f"{lp/initial_capital:.1%}")
         with c5: metric_card("做空總獲利", f"{sp:,.0f}", delta=f"{sp/initial_capital:.1%}")
         with c6: metric_card("總成本", f"{cost:,.0f}", delta=f"-{cost/initial_capital:.1%}", delta_color="inverse")
         
+        # Equity Curve
+        st.subheader("資產曲線")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Total_Equity'], name='總資產', line=dict(color='#d32f2f', width=3)))
-        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Benchmark'], name='Buy & Hold 00631L', line=dict(color='gray', width=3)))
-        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Long_Equity'], name='做多', line=dict(dash='dot')))
-        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Short_Equity'], name='做空', line=dict(dash='dot')))
-        fig.update_layout(title="資產曲線", height=600, hovermode="x unified")
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Total_Equity'], mode='lines', name='總資產 (策略)', line=dict(color='#d32f2f', width=3)))
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Benchmark'], mode='lines', name='Buy & Hold 00631L (對照)', line=dict(color='#9e9e9e', width=3)))
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Long_Equity'], mode='lines', name='做多部位', line=dict(width=1.5, dash='dot')))
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['Short_Equity'], mode='lines', name='做空部位', line=dict(width=1.5, dash='dot')))
+        
+        fig.update_layout(title="策略 vs. 純買進持有 (00631L)", xaxis_title="日期", yaxis_title="金額 (TWD)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), template="plotly_white", height=600)
         st.plotly_chart(fig, use_container_width=True)
         
         # Trend 100
+        st.subheader("最近 100 日多空趨勢分析")
         dfr = df_res.iloc[-100:].copy()
         dfr['C'] = dfr['Position'].apply(lambda x: 'green' if x==1 else 'red')
-        figt = go.Figure(go.Bar(x=dfr.index, y=dfr['TAIEX'], marker_color=dfr['C']))
-        figt.update_layout(title="近100日趨勢 (紅=多/綠=空)", yaxis_range=[dfr['TAIEX'].min()*0.95, dfr['TAIEX'].max()*1.05])
+        figt = go.Figure(go.Bar(x=dfr.index, y=dfr['TAIEX'], marker_color=dfr['C'], name='趨勢'))
+        figt.update_layout(title="近100日趨勢 (紅=多方/綠=空方避險)", yaxis_range=[dfr['TAIEX'].min()*0.95, dfr['TAIEX'].max()*1.05], showlegend=False, xaxis_title="日期", yaxis_title="加權指數", template="plotly_white")
         st.plotly_chart(figt, use_container_width=True)
         
     with t2:
@@ -407,88 +423,521 @@ def render_original_strategy_page(df):
         ben_mdd = ben_dd.min()
         
         tr_cnt = len(trades)
-        win = pd.DataFrame(trades)['獲利金額 (TWD)'].gt(0).mean() if trades else 0
+        if trades:
+            dft = pd.DataFrame(trades)
+            win = dft['獲利金額 (TWD)'].gt(0).mean()
+        else:
+            win = 0
         
         c1, c2, c3, c4 = st.columns(4)
-        metric_card("策略 MDD", f"{mdd:.2%}", delta_color="inverse")
-        metric_card("00631L MDD", f"{ben_mdd:.2%}", delta=f"{ben_mdd-mdd:.2%}", delta_color="inverse")
-        metric_card("做空次數", f"{tr_cnt}")
-        metric_card("做空勝率", f"{win:.2%}")
+        with c1: metric_card("策略最大回撤 (MDD)", f"{mdd:.2%}", delta_color="inverse")
+        with c2: metric_card("大盤最大回撤", f"{ben_mdd:.2%}", delta=f"{ben_mdd-mdd:.2%}", delta_color="inverse")
+        with c3: metric_card("做空次數", f"{tr_cnt}")
+        with c4: metric_card("做空勝率", f"{win:.2%}")
         
+        st.subheader("回撤曲線 (Drawdown)")
         figd = go.Figure()
         figd.add_trace(go.Scatter(x=dd.index, y=dd, fill='tozeroy', line=dict(color='red'), name='策略回撤'))
         figd.add_trace(go.Scatter(x=ben_dd.index, y=ben_dd, line=dict(color='gray', dash='dot'), name='00631L回撤'))
+        figd.update_layout(title="總資產回撤幅度", yaxis_title="回撤 %", hovermode="x unified", template="plotly_white", yaxis=dict(tickformat=".0%"))
         st.plotly_chart(figd, use_container_width=True)
         
     with t3:
-        st.subheader("年度分析")
-        df_res['Y'] = df_res.index.year
-        yr = df_res.groupby('Y').agg({'Total_Equity':['first','last'], 'Benchmark':['first','last']})
+        st.subheader("年度報酬率與風險分析")
+        df_res['Year'] = df_res.index.year
+        yr = df_res.groupby('Year').agg({'Total_Equity':['first','last'], 'Benchmark':['first','last']})
+        
         yret = pd.DataFrame()
-        yret['Ret'] = (yr['Total_Equity']['last'] - yr['Total_Equity']['first']) / yr['Total_Equity']['first']
-        yret['Ben'] = (yr['Benchmark']['last'] - yr['Benchmark']['first']) / yr['Benchmark']['first']
-        yret['Alpha'] = yret['Ret'] - yret['Ben']
-        st.dataframe(yret.style.format("{:.2%}"), use_container_width=True)
+        yret['年化報酬率'] = (yr['Total_Equity']['last'] - yr['Total_Equity']['first']) / yr['Total_Equity']['first']
+        yret['Benchmark 報酬率'] = (yr['Benchmark']['last'] - yr['Benchmark']['first']) / yr['Benchmark']['first']
+        yret['超額報酬 (Alpha)'] = yret['年化報酬率'] - yret['Benchmark 報酬率']
+        
+        ymdd = []
+        for year in yret.index:
+            dy = df_res[df_res['Year'] == year]
+            e = dy['Total_Equity']
+            d = (e - e.cummax()) / e.cummax()
+            ymdd.append(d.min())
+        yret['策略最大回撤 (MDD)'] = ymdd
+        
+        # Add Avg
+        avg = yret.mean()
+        yret.loc['平均值 (Avg)'] = avg
+        
+        def hl_avg(row):
+            if row.name == '平均值 (Avg)': return ['background-color: #fff8e1; color: #bf360c; font-weight: bold'] * len(row)
+            return [''] * len(row)
+            
+        st.dataframe(yret.style.apply(hl_avg, axis=1).format("{:.2%}"), use_container_width=True)
+        
+        st.markdown("""
+        <div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; font-size: 0.9em; color: #555;">
+        <b>指標說明：</b>
+        <ul style="margin-bottom: 0;">
+            <li><b>年化報酬率</b>: 策略在該年度的總投資報酬率</li>
+            <li><b>Benchmark 報酬率</b>: 單純買進持有 00631L 的年度報酬率</li>
+            <li><b>超額報酬 (Alpha)</b>: 策略報酬 - Benchmark 報酬</li>
+            <li><b>策略最大回撤 (MDD)</b>: 該年度資產最大回落幅度</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.subheader("月度報酬率分析 (總資產)")
+        df_res['Month'] = df_res.index.to_period('M')
+        m_stats = df_res.groupby('Month')['Total_Equity'].agg(['first', 'last'])
+        m_stats['Ret'] = (m_stats['last'] - m_stats['first']) / m_stats['first']
+        m_stats['Y'] = m_stats.index.year
+        m_stats['M'] = m_stats.index.month
+        piv = m_stats.pivot(index='Y', columns='M', values='Ret')
+        piv.columns = [f"{i}月" for i in range(1, 13)]
+        
+        def c_ret(v):
+            if pd.isna(v): return ''
+            c = 'red' if v > 0 else 'green'
+            return f'color: {c}'
+            
+        st.dataframe(piv.style.format("{:.2%}").map(c_ret), use_container_width=True)
         
     with t4:
-        st.subheader("交易明細")
+        st.subheader("📋 交易明細")
         if trades:
-            dft = pd.DataFrame(trades)
-            st.dataframe(dft, use_container_width=True)
-            st.download_button("下載 CSV", dft.to_csv().encode('utf-8-sig'), "trades.csv")
+            df_trades = pd.DataFrame(trades)
+            # Check if columns exist before applying
+            if '進場日期' in df_trades.columns:
+                df_trades['進場日期'] = df_trades['進場日期'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, pd.Timestamp) else x)
+            if '出場日期' in df_trades.columns:
+                df_trades['出場日期'] = df_trades['出場日期'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, pd.Timestamp) else x)
+            
+            def color_pnl(val):
+                if pd.isna(val) or isinstance(val, str): return ''
+                color = 'red' if val > 0 else 'green'
+                return f'color: {color}'
+            
+            # Safe styling
+            st.dataframe(df_trades.style.applymap(color_pnl, subset=['獲利金額 (TWD)', '報酬率'])
+                         .format({'進場指數': '{:,.0f}', '出場指數': '{:,.0f}', '避險口數': '{:.2f}', 
+                                  '獲利點數': '{:,.0f}', '獲利金額 (TWD)': '{:,.0f}', '報酬率': '{:.2%}'}),
+                         use_container_width=True)
+            
+            # Annual Short P&L Summary
+            st.divider()
+            st.subheader("📅 每年做空避險損益統計")
+            
+            df_trades_raw = pd.DataFrame(trades)
+            # Ensure '出場日期' is datetime
+            if '出場日期' in df_trades_raw.columns:
+                df_trades_raw['Year'] = pd.to_datetime(df_trades_raw['出場日期']).dt.year
+                annual_short_pnl = df_trades_raw.groupby('Year')['獲利金額 (TWD)'].sum().reset_index()
+                annual_short_pnl.columns = ['年份', '做空總損益 (TWD)']
+                
+                # Add Trade Count per year
+                annual_counts = df_trades_raw.groupby('Year').size().reset_index(name='交易次數')
+                annual_counts.columns = ['年份', '交易次數']
+                annual_summary = pd.merge(annual_short_pnl, annual_counts, on='年份')
+                
+                # Calculate Average P&L per trade
+                annual_summary['平均單筆損益'] = annual_summary['做空總損益 (TWD)'] / annual_summary['交易次數']
+                
+                def color_annual_pnl(val):
+                    color = 'red' if val > 0 else 'green'
+                    return f'color: {color}'
+
+                st.dataframe(
+                    annual_summary.style.applymap(color_annual_pnl, subset=['做空總損益 (TWD)', '平均單筆損益'])
+                    .format({'年份': '{:d}', '做空總損益 (TWD)': '{:,.0f}', '平均單筆損益': '{:,.0f}'}),
+                    use_container_width=True,
+                    column_config={
+                        "年份": st.column_config.NumberColumn("年份", format="%d"),
+                    }
+                )
+            
+            # Export Buttons
+            st.divider()
+            st.subheader("📥 資料匯出")
+            col_ex1, col_ex2 = st.columns(2)
+            
+            csv_trades = df_trades.to_csv(index=False).encode('utf-8-sig')
+            col_ex1.download_button(
+                label="下載交易明細 (CSV)",
+                data=csv_trades,
+                file_name='trades_record.csv',
+                mime='text/csv',
+            )
+            
+            csv_equity = df_res.to_csv().encode('utf-8-sig')
+            col_ex2.download_button(
+                label="下載每日資產權益 (CSV)",
+                data=csv_equity,
+                file_name='daily_equity.csv',
+                mime='text/csv',
+            )
+        else:
+            st.info("區間內無做空交易")
             
     with t5:
-        st.subheader("最新訊號")
-        last = df_res.iloc[-1]
-        sig = "空方" if last['TAIEX'] < last['MA'] else "多方"
-        st.metric("目前訊號", sig, delta=f"乖離率 {(last['TAIEX']-last['MA'])/last['MA']:.2%}")
+        st.subheader("🔭 最新市場狀態與操作建議")
+        
+        last_row = df_res.iloc[-1]
+        last_date = df_res.index[-1]
+        last_close = last_row['TAIEX']
+        last_ma = last_row['MA']
+        last_00631L = last_row['00631L']
+        
+        # Load Real World Settings if available
+        SETTINGS_FILE = "user_simulation_settings.json"
+        real_settings = None
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r") as f:
+                    real_settings = json.load(f)
+            except:
+                pass
+        
+        # Determine Signal
+        is_bearish = last_close < last_ma
+        signal_text = "空方 (跌破均線)" if is_bearish else "多方 (站上均線)"
+        action_text = "⚠️ 啟動避險 (做空小台)" if is_bearish else "✅ 僅持有做多部位 (00631L)"
+        signal_color = "red" if not is_bearish else "green"
+        
+        st.markdown(f"""
+        ### 📅 資料日期：{last_date.strftime('%Y-%m-%d')}
+        
+        #### 📊 市場數據
+        - **加權指數收盤**：{last_close:,.0f}
+        - **均線 ({ma_period}MA)**：{last_ma:,.0f}
+        - **乖離率**：{((last_close - last_ma) / last_ma):.2%}
+        
+        #### 🚦 訊號判斷
+        - **目前趨勢**：<span style="color:{signal_color};font-weight:bold;font-size:1.2em">{signal_text}</span>
+        - **操作建議**：<span style="color:{signal_color};font-weight:bold;font-size:1.2em">{action_text}</span>
+        """, unsafe_allow_html=True)
+        
+        st.divider()
+        
+        st.subheader("💰 目前部位損益試算 (基於真實模擬設定)")
+        
+        col_s1, col_s2 = st.columns(2)
+        
+        # 1. 00631L Status
+        with col_s1:
+            st.markdown("#### 🐂 00631L (做多部位)")
+            
+            # Use Real Settings if available
+            if real_settings:
+                user_shares = real_settings.get('shares_00631L', 0)
+                curr_val_00631L = user_shares * last_00631L
+                st.write(f"**目前持有股數**：{user_shares:,.0f} 股")
+            else:
+                curr_val_00631L = df_res['Long_Equity'].iloc[-1]
+                st.write(f"**目前模擬市值**：{curr_val_00631L:,.0f} TWD (回測資金)")
+
+            st.write(f"**目前市值**：{curr_val_00631L:,.0f} TWD")
+            st.write(f"**約當大盤曝險**：{curr_val_00631L * 2:,.0f} TWD (2倍槓桿)")
+        
+        # 2. Short Leg Status
+        with col_s2:
+            st.markdown("#### 🐻 小台 (做空避險部位)")
+            
+            if real_settings:
+                # Real Mode
+                held_contracts = real_settings.get('held_contracts', 0)
+                is_holding_short = held_contracts > 0
+                st.write(f"**目前持有口數**：{held_contracts} 口")
+            else:
+                # Sim Mode
+                is_holding_short = last_row['Position'] == 1
+                held_contracts = "模擬部位"
+
+            if is_holding_short:
+                st.write("**目前狀態**：🔴 持有空單中")
+                
+                # Reason for holding short
+                if last_close < last_ma:
+                    diff_points = last_ma - last_close
+                    st.markdown(f"📉 **持有原因**：目前指數 ({last_close:,.0f}) 低於 {ma_period}MA ({last_ma:,.0f}) 共 **{diff_points:,.0f}** 點")
+                    st.markdown(f"👉 **後續操作**：續抱空單")
+                else:
+                    diff_points = last_close - last_ma
+                    st.markdown(f"⚠️ **持有原因**：昨日收盤跌破均線 (目前指數 {last_close:,.0f} 已高於均線 **{diff_points:,.0f}** 點，轉為多方訊號)")
+                    st.markdown(f"👉 **後續操作**：🔴 **應平倉空單** (訊號轉多)")
+                
+                if not real_settings: # Only show entry analysis for Simulation Mode or if valid
+                    # Find Entry (Logic: scan backwards for Position=0)
+                    current_trade_entry_index = -1
+                    for i in range(len(df_res)-1, -1, -1):
+                        if df_res['Position'].iloc[i] == 0:
+                            current_trade_entry_index = i + 1
+                            break
+                    if current_trade_entry_index == -1: current_trade_entry_index = 0
+                    if current_trade_entry_index >= len(df_res): current_trade_entry_index = 0
+                    
+                    entry_row = df_res.iloc[current_trade_entry_index]
+                    entry_date = df_res.index[current_trade_entry_index]
+                    entry_price = entry_row['TAIEX']
+                    
+                    # Current Short P&L
+                    contracts_est = 1 # Dummy for sim
+                    points_diff = entry_price - last_close
+                    profit_twd = points_diff * 50 * contracts_est
+                    ret = (entry_price - last_close) / entry_price
+                    
+                    st.markdown("---")
+                    st.markdown("#### ⚖️ 本次空單持有績效 (回測模擬)")
+                    st.write(f"**進場日期**：{entry_date.strftime('%Y-%m-%d')}")
+                    st.metric("進場指數", f"{entry_price:,.0f}")
+                    st.metric("目前指數", f"{last_close:,.0f}", delta=f"{last_close - entry_price:,.0f}", delta_color="inverse")
+                else:
+                     st.info("真實部位損益請參考券商報價，此處僅提供策略訊號指引。")
+
+            else:
+                st.write("**目前狀態**：⚪ 空手 (無避險)")
+                st.write(f"**明日操作指引**：{'續抱空單' if is_bearish else '維持空手'}")
         
     with t6:
-        st.subheader("參數敏感度")
-        ma_s = st.number_input("MA Start", 5)
-        ma_e = st.number_input("MA End", 60)
-        if st.button("Run Sensitivity"):
-            res = []
-            pg = st.progress(0)
-            rng = range(ma_s, ma_e+1, 2)
-            for i, m in enumerate(rng):
-                _d, _, _, _, _ = run_backtest_original(df_test_raw, m, initial_capital, long_alloc, short_alloc, margin, hedge_mode, do_rebalance, rebalance_long_target, fee, tax, slip, inc_cost)
-                fe = _d['Total_Equity'].iloc[-1]
-                res.append({'MA': m, 'Ret': (fe-initial_capital)/initial_capital})
-                pg.progress((i+1)/len(rng))
-            st.line_chart(pd.DataFrame(res).set_index('MA'))
+        st.subheader("🎯 參數敏感度分析 (MA Sensitivity)")
+        
+        # Date Context
+        if not df.empty:
+            sa_start_date = df.index.min().date()
+            sa_end_date = df.index.max().date()
+            sa_days = (sa_end_date - sa_start_date).days
+            sa_years = sa_days / 365.25
+            st.info(f"此功能將測試不同均線週期對策略績效的影響。\n\n**目前回測區間**：{sa_start_date} ~ {sa_end_date} (約 {sa_years:.1f} 年)")
+        
+        col_sa1, col_sa2 = st.columns(2)
+        ma_start = col_sa1.number_input("MA 起始", value=5, step=1)
+        ma_end = col_sa2.number_input("MA 結束", value=80, step=1)
+        ma_step = st.slider("間隔 (Step)", 1, 10, 2)
+        
+        if st.button("開始分析"):
+            progress_bar = st.progress(0)
+            results = []
+            ma_range = range(ma_start, ma_end + 1, ma_step)
+            total_steps = len(ma_range)
+            
+            for idx, m in enumerate(ma_range):
+                # Run Backtest (Silent)
+                _df, _trades, _lp, _sp, _cost = run_backtest_original(
+                    df, m, initial_capital, long_alloc, short_alloc, margin, 
+                    hedge_mode, do_rebalance, rebalance_long_target, fee, tax, slip, inc_cost
+                )
+                
+                final_eq = _df['Total_Equity'].iloc[-1]
+                ret = (final_eq - initial_capital) / initial_capital
+                
+                eq_curve = _df['Total_Equity']
+                mdd = ((eq_curve - eq_curve.cummax()) / eq_curve.cummax()).min()
+                
+                results.append({
+                    'MA': m,
+                    'Return': ret,
+                    'MDD': mdd
+                })
+                progress_bar.progress((idx + 1) / total_steps)
+            
+            df_sa = pd.DataFrame(results)
+            
+            # Find Best Parameter
+            best_row = df_sa.loc[df_sa['Return'].idxmax()]
+            best_ma = int(best_row['MA'])
+            best_ret = best_row['Return']
+            
+            st.success(f"**最佳均線天數：{best_ma}**，累積報酬率：{best_ret:.2%}")
+            
+            # Benchmark Return
+            benchmark_start = df['00631L'].iloc[0]
+            benchmark_end = df['00631L'].iloc[-1]
+            benchmark_ret = (benchmark_end - benchmark_start) / benchmark_start
+            
+            st.markdown(f"""
+            <div style="background-color: #e3f2fd; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
+                <strong>📊 績效對照：</strong>
+                <ul>
+                    <li><strong>策略最佳報酬率</strong>: {best_ret:.2%} (MA={best_ma})</li>
+                    <li><strong>00631L (Buy & Hold) 報酬率</strong>: {benchmark_ret:.2%}</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if st.button(f"套用最佳參數 (MA={best_ma})"):
+                st.session_state['ma_period'] = best_ma
+                st.rerun()
+            
+            # Visualization (Line Chart)
+            st.subheader("不同均線天數累積報酬率")
+            fig_sa_ret = go.Figure()
+            fig_sa_ret.add_trace(go.Scatter(
+                x=df_sa['MA'],
+                y=df_sa['Return'],
+                mode='lines+markers',
+                name='累積報酬率',
+                line=dict(width=3)
+            ))
+            fig_sa_ret.update_layout(
+                xaxis_title="均線天數", 
+                yaxis_title="累積報酬率", 
+                template="plotly_white",
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig_sa_ret, use_container_width=True)
+            
+            st.subheader("🏆 績效前五名參數 (Top 5)")
+            top_5 = df_sa.sort_values('Return', ascending=False).head(5).reset_index(drop=True)
+            top_5.index += 1 # Rank 1-based
+            
+            # Format as string percentage to ensure integer display
+            top_5['Return_Str'] = top_5['Return'].apply(lambda x: f"{x:.0%}")
+
+            st.dataframe(
+                top_5[['MA', 'Return_Str']],
+                use_container_width=True,
+                column_config={
+                    "MA": st.column_config.NumberColumn("均線天數 (MA)", format="%d"),
+                    "Return_Str": st.column_config.TextColumn("累積報酬率")
+                }
+            )
+            
+            st.markdown("---")
+            st.markdown("""
+            ### 🏆 總結：如何選擇最佳參數？
+            最佳的參數通常是 **「報酬率高 (高原區)」** 與 **「回撤風險低 (淺水區)」** 的交集。
+            *   若某個參數報酬率極高，但回撤也極大，可能不適合心臟不夠強的投資人。
+            *   建議選擇一個**位於穩定的高原區中間**的數值，而不是極端值，以避免「過度擬合 (Overfitting)」的風險。
+            """)
+            
+            st.success("分析完成！")
             
     with t7:
-        st.subheader("真實模擬")
-        st.info("輸入目前部位，系統建議操作")
-        sf = "user_simulation_settings.json"
-        defs = {"s631": 1000, "scap": 100000, "shold": 0}
-        if os.path.exists(sf):
-            try: defs.update(json.load(open(sf))) 
-            except: pass
+        st.subheader("🎮 真實操作模擬 (Real-world Simulation)")
+        st.info("在此輸入您目前的實際資產狀況，系統將根據策略邏輯提供操作建議。")
+        
+        # Load Settings
+        SETTINGS_FILE = "user_simulation_settings.json"
+        default_settings = {
+            "shares_00631L": 1000,
+            "short_capital": 100000,
+            "held_contracts": 0
+        }
+        
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r") as f:
+                    saved_settings = json.load(f)
+                    default_settings.update(saved_settings)
+            except:
+                pass
+
+        col_real_1, col_real_2 = st.columns(2)
+        
+        with col_real_1:
+            st.markdown("#### 1. 輸入目前資產狀況")
             
-        c1, c2 = st.columns(2)
-        s631 = c1.number_input("00631L 股數", value=defs['s631'], step=1000)
-        scap = c1.number_input("保證金餘額", value=defs['scap'], step=10000)
-        shold = c1.number_input("持有空單口數", value=defs['shold'], step=1)
-        
-        # Logic... simplified for brevity but core logic here
-        last_p = last['TAIEX']
-        is_bear = last_p < last['MA']
-        
-        tgt_c = 0
-        if is_bear:
-            max_c = int(scap / (3.0 * margin))
-            if hedge_mode == '完全避險 (Neutral Hedge)':
-                tgt_c = min(int(round((s631 * last['00631L'] * 2)/(last_p*50))), max_c)
+            # Input Shares instead of Value
+            real_shares_00631L = st.number_input("目前 00631L 持有股數 (Shares)", value=int(default_settings["shares_00631L"]), step=1000)
+            real_short_capital = st.number_input("目前 期貨保證金專戶餘額 (權益數 TWD)", value=int(default_settings["short_capital"]), step=10000)
+            real_held_contracts = st.number_input("目前 持有小台口數 (空單)", value=int(default_settings["held_contracts"]), step=1)
+            
+            # Save Settings
+            current_settings = {
+                "shares_00631L": real_shares_00631L,
+                "short_capital": real_short_capital,
+                "held_contracts": real_held_contracts
+            }
+            if current_settings != default_settings:
+                with open(SETTINGS_FILE, "w") as f:
+                    json.dump(current_settings, f)
+            
+            st.markdown("#### 2. 確認市場數據 (預設為最新)")
+            # Get last data from df_res
+            last_row = df_res.iloc[-1]
+            last_close_val = last_row['TAIEX']
+            last_ma_val = last_row['MA']
+            last_00631L_val = last_row['00631L']
+
+            sim_last_close = st.number_input("加權指數收盤價", value=float(last_close_val), step=10.0)
+            sim_ma = st.number_input(f"目前 {ma_period}MA", value=float(last_ma_val), step=10.0)
+            
+            # Auto-calc Value
+            sim_price_00631L = last_00631L_val 
+            real_long_value = real_shares_00631L * sim_price_00631L
+            st.info(f"ℹ️ 00631L 目前參考價: {sim_price_00631L:.2f} | 推算市值: {real_long_value:,.0f} TWD")
+            
+        with col_real_2:
+            st.markdown("#### 3. 策略運算結果")
+            
+            # Logic
+            sim_is_bearish = sim_last_close < sim_ma
+            sim_signal_text = "空方 (跌破均線)" if sim_is_bearish else "多方 (站上均線)"
+            sim_signal_color = "red" if not sim_is_bearish else "green"
+            
+            st.markdown(f"**目前訊號**：<span style='color:{sim_signal_color};font-weight:bold'>{sim_signal_text}</span>", unsafe_allow_html=True)
+            
+            # Signal Details
+            diff_points = sim_last_close - sim_ma
+            if sim_is_bearish:
+                st.caption(f"📉 指數 ({sim_last_close:,.0f}) 低於 {ma_period}MA ({sim_ma:,.0f}) 共 {abs(diff_points):,.0f} 點")
             else:
-                tgt_c = max_c
-        
-        diff = tgt_c - shold
-        c2.metric("建議操作", f"{'加空' if diff>0 else '回補'} {abs(diff)} 口", help=f"目標 {tgt_c} 口")
-        
-        # Save
-        json.dump({"s631": s631, "scap": scap, "shold": shold}, open(sf, 'w'))
+                st.caption(f"📈 指數 ({sim_last_close:,.0f}) 高於 {ma_period}MA ({sim_ma:,.0f}) 共 {abs(diff_points):,.0f} 點")
+            
+            # Calculate Target Contracts
+            # Risk Limit
+            safe_margin_factor = 3.0
+            # Use 'margin' from outer scope
+            sim_max_contracts = int(real_short_capital / (safe_margin_factor * margin)) if margin > 0 else 0
+            
+            if sim_is_bearish:
+                if hedge_mode == "完全避險 (Neutral Hedge)":
+                    sim_target_notional = real_long_value * 2
+                    # Avoid divide by zero
+                    if sim_last_close > 0:
+                        sim_target_contracts_raw = int(round(sim_target_notional / (sim_last_close * 50)))
+                    else:
+                        sim_target_contracts_raw = 0
+                    sim_target_contracts = min(sim_target_contracts_raw, sim_max_contracts)
+                    hedge_reason = f"對沖 2倍市值 (目標 {sim_target_contracts_raw} 口)，受資金/風險限制"
+                else: # Aggressive
+                    sim_target_contracts = sim_max_contracts
+                    hedge_reason = "積極做空 (資金允許最大口數，風險指標 >= 300%)"
+            else:
+                sim_target_contracts = 0
+                hedge_reason = "多方趨勢，不需避險"
+            
+            # Action
+            diff_contracts = sim_target_contracts - real_held_contracts
+            
+            if diff_contracts > 0:
+                action_msg = f"🔴 加空 {diff_contracts} 口"
+                action_desc = f"目前持有 {real_held_contracts} 口，目標 {sim_target_contracts} 口"
+            elif diff_contracts < 0:
+                action_msg = f"🟢 回補 {abs(diff_contracts)} 口"
+                action_desc = f"目前持有 {real_held_contracts} 口，目標 {sim_target_contracts} 口"
+            else:
+                action_msg = "⚪ 維持現狀"
+                action_desc = f"目前持有 {real_held_contracts} 口，符合目標"
+            
+            metric_card("建議操作", action_msg, delta=f"目標: {sim_target_contracts} 口 ({action_desc})")
+            st.write(f"**策略邏輯**：{hedge_reason}")
+            
+            st.divider()
+            
+            # Risk Preview
+            st.markdown("#### ⚠️ 調整後風險預估")
+            sim_required_margin = sim_target_contracts * margin
+            if sim_required_margin > 0:
+                sim_risk_ratio = real_short_capital / sim_required_margin
+            else:
+                sim_risk_ratio = 999
+            
+            sim_risk_color = "red" if sim_risk_ratio < 3.0 else "green"
+            # metric_card for Risk
+            metric_card("預估風險指標", f"{sim_risk_ratio:.0%}", delta="目標 > 300%", delta_color="normal")
+            
+            if sim_risk_ratio < 3.0 and sim_target_contracts > 0:
+                st.warning("⚠️ 注意：即使調整後，風險指標仍低於 300%，建議補錢或減少口數。")
+            elif sim_target_contracts == 0:
+                st.success("目前無部位，無風險。")
+            else:
+                st.success("風險指標安全。")
 
 # --- Render Function: New Strategy ---
 def render_rebalance_page(df):
