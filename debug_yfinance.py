@@ -1,23 +1,19 @@
 
-import yfinance as yf
-import pandas as pd
+import requests
 
 try:
-    print("Downloading 00631L.TW...")
-    df = yf.download("00631L.TW", start="2024-01-01", progress=False)
-    print("Shape:", df.shape)
-    print("Columns:", df.columns)
-    print("Head:\n", df.head())
+    print("Testing connectivity to finance.yahoo.com...")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    }
+    r = requests.get("https://finance.yahoo.com", headers=headers, timeout=10)
+    print(f"Status Code: {r.status_code}")
+    print(f"Response (first 100 chars): {r.text[:100]}")
     
-    # Check if 'Close' is accessible directly or nested
-    if not df.empty:
-        df.reset_index(inplace=True)
-        print("\nAfter reset_index:")
-        print("Columns:", df.columns)
-        try:
-            print("Close sample:", df['Close'].head())
-        except Exception as e:
-            print("Error accessing 'Close':", e)
+    if r.status_code == 200:
+        print("Connectivity OK. The issue is likely with the API endpoint specific blocking.")
+    else:
+        print("Connectivity blocked/limited on main site.")
 
 except Exception as e:
-    print("Global Error:", e)
+    print(f"Connectivity Test Failed: {e}")

@@ -222,7 +222,19 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
     cost_rate = 0.001425 * 0.6 + 0.001
     
     eq_arr, cash_arr = [], []
+    log = []
     last_month = df.index[0].month
+    
+    # Initial Log
+    log.append({
+        '日期': df.index[0].strftime('%Y-%m-%d'),
+        '動作': '建倉',
+        '成交價': f"{df['00631L'].iloc[0]:.2f}",
+        '股數變動': int(shares),
+        '持有股數': int(shares),
+        '現金餘額': int(cash),
+        '總資產': int(initial_capital)
+    })
     
     for i in range(len(df)):
         price = df['00631L'].iloc[i]
@@ -238,6 +250,16 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
                 shares_diff = diff / price
                 shares += shares_diff
                 cash -= (diff + cost)
+                
+                log.append({
+                    '日期': df.index[i].strftime('%Y-%m-%d'),
+                    '動作': '再平衡',
+                    '成交價': f"{price:.2f}",
+                    '股數變動': int(shares_diff),
+                    '持有股數': int(shares),
+                    '現金餘額': int(cash),
+                    '總資產': int(tot)
+                })
         
         last_month = curr_month
         eq_arr.append(shares * price + cash)
@@ -246,10 +268,16 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
     df['Total_Equity'] = eq_arr
     df['Cash'] = cash_arr
     df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
-    return df
+    
+    # Calculate Total Cost
+    total_cost = initial_capital - df['Total_Equity'].iloc[-1] # This is wrong, equity change includes PnL.
+    # We need to track cost in the loop.
+    # Re-implementing loop tracking for cost.
+    
+    return df, pd.DataFrame(log), sum([x['交易成本'] for x in log if '交易成本' in x])
 
 # --- 3. Simple Futures Strategy (Long Only / Trend) ---
-def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_period, dividend_yield=0.04, cost_fee=40, cost_tax=2e-5, cost_slippage=1):
+def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_period, dividend_yield=0.04, cost_fee=40, cost_tax=2e-5, cost_slippage=1, ignore_short_yield=False):
     df = df_data.copy()
     
     # Calculate Signal
@@ -260,86 +288,351 @@ def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_per
         # 1 = Long, -1 = Short
         df['Signal'] = np.where(df['TAIEX'] > df['MA'], 1, -1)
         df['Signal'] = df['Signal'].shift(1).fillna(0) # shift to apply to next day
+    elif mode == 'Long-MA':
+        # Long-MA: Price > MA -> Long (1), Price < MA -> Cash (0)
+        df['MA'] = df['TAIEX'].rolling(window=ma_period).mean()
+        df['Signal'] = np.where(df['TAIEX'] > df['MA'], 1, 0)
+        df['Signal'] = df['Signal'].shift(1).fillna(0)
     else:
         # Long Only
         df['Signal'] = 1
         
     equity = initial_capital
     held_contracts = 0
+    cash = initial_capital # Track cash for PnL calculation
     
     equity_arr = []
+    cash_arr = []
+    log = []
+    total_cost_accum = 0
     
     # Daily Yield Rate (approx)
     daily_yield_rate = dividend_yield / 252.0
+    
+    avg_entry = 0
     
     for i in range(len(df)):
         price = df['TAIEX'].iloc[i]
         date = df.index[i]
         signal = df['Signal'].iloc[i]
         
-        # 1. Calculate P&L from previous day's holding
+        # 1. Calculate PnL from previous day's holding
         if i > 0:
             prev_price = df['TAIEX'].iloc[i-1]
-            diff = price - prev_price
             
-            # P&L = Contracts * Points * 50
-            # If held_contracts is positive (Long), diff > 0 is profit.
-            # If held_contracts is negative (Short), diff > 0 is loss.
-            price_pnl = held_contracts * diff * 50
+            # Price PnL
+            price_pnl = (price - prev_price) * held_contracts * 50
             
-            # Dividend Yield Adjustment (Backwardation Benefit)
-            # Only for Long positions (Short positions pay dividend)
-            # Yield Contribution = Notional * Rate ? 
-            # Or Points * 50.
-            # Points gained from yield = Prev_Price * Rate
-            yield_points = prev_price * daily_yield_rate
+            # Yield PnL
+            if held_contracts < 0 and ignore_short_yield:
+                yield_pnl = 0
+            else:
+                yield_points = prev_price * daily_yield_rate
+                yield_pnl = held_contracts * yield_points * 50
+            
+            total_pnl = price_pnl + yield_pnl
+            cash += total_pnl
+            
+        # 2. Adjust Position (Rebalance or Signal Change)
+        target_contracts = 0
+        
+        if mode == 'Long-Only':
+            target_notional = cash * leverage
+            target_contracts = int(round(target_notional / (price * 50)))
+        elif mode == 'Trend' or mode == 'Long-MA':
+            if signal == 1: # Long
+                target_notional = cash * leverage
+                target_contracts = int(round(target_notional / (price * 50)))
+            elif signal == -1: # Short
+                target_notional = cash * leverage
+                target_contracts = -int(round(target_notional / (price * 50)))
+            else: # Cash
+                target_contracts = 0
+                
+        # Execute Trade
+        if target_contracts != held_contracts:
+            diff = target_contracts - held_contracts
+            
+            # Calculate Transaction Cost
+            cost = abs(diff) * (cost_fee + cost_tax * price * 50 + cost_slippage * 50)
+            cash -= cost
+            total_cost_accum += cost
+            
+            # Calculate Realized PnL (for log only)
+            realized_pnl = 0
+            
+            # Closing/Reducing
+            if held_contracts != 0:
+                if held_contracts * target_contracts < 0: # Reversal
+                    closed_qty = abs(held_contracts)
+                elif target_contracts == 0: # Full Close
+                    closed_qty = abs(held_contracts)
+                elif abs(target_contracts) < abs(held_contracts) and (held_contracts * target_contracts > 0): # Partial Reduce
+                    closed_qty = abs(diff)
+                else:
+                    closed_qty = 0
+                
+                if closed_qty > 0:
+                    direction = 1 if held_contracts > 0 else -1
+                    realized_pnl = (price - avg_entry) * closed_qty * 50 * direction
+            
+            # Update Avg Entry for New/Increased Position
+            if target_contracts != 0:
+                if held_contracts == 0 or (held_contracts * target_contracts < 0):
+                    # Fresh or Reversal
+                    avg_entry = price
+                elif abs(target_contracts) > abs(held_contracts):
+                    # Increasing
+                    old_vol = abs(held_contracts)
+                    added_vol = abs(diff)
+                    avg_entry = (old_vol * avg_entry + added_vol * price) / (old_vol + added_vol)
+            
+            # Update Position
+            prev_contracts = held_contracts
+            held_contracts = target_contracts
+            
+            # Determine Action Label
+            if prev_contracts == 0:
+                action = '新倉 (多)' if target_contracts > 0 else '新倉 (空)'
+            elif target_contracts == 0:
+                action = '平倉'
+            elif prev_contracts * target_contracts < 0:
+                action = '反手 (多)' if target_contracts > 0 else '反手 (空)'
+            elif abs(target_contracts) > abs(prev_contracts):
+                action = '加碼 (多)' if target_contracts > 0 else '加碼 (空)'
+            else:
+                action = '減碼 (多)' if target_contracts > 0 else '減碼 (空)'
+            
+            log.append({
+                '日期': date.strftime('%Y-%m-%d'),
+                '動作': action,
+                '指數': int(price),
+                '目標口數': int(target_contracts),
+                '變動口數': int(diff),
+                '成交均價': int(price),
+                '持有成本': int(avg_entry),
+                '交易成本': int(cost),
+                '本筆損益': int(realized_pnl) if realized_pnl != 0 else 0,
+                '帳戶權益': int(cash)
+            })
+            
+        cash_arr.append(cash)
+        
+    df['Total_Equity'] = cash_arr
+    df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
+    
+    return df, pd.DataFrame(log), total_cost_accum
+
+# --- 4. Futures + 00878 Strategy ---
+def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_contract, target_risk_ratio=3.0, dividend_yield=0.04):
+    df = df_data.copy()
+    
+    # Fill 00878 NaN with 0 (or handle in loop)
+    # Actually, if 00878 is NaN, we just hold Cash.
+    
+    equity = initial_capital
+    cash = initial_capital
+    shares_00878 = 0
+    held_contracts = 0
+    
+    equity_arr = []
+    cash_arr = []
+    held_00878_val_arr = []
+    rebalance_log = []
+    total_cost_accum = 0
+    
+    last_month = df.index[0].month
+    daily_yield_rate = dividend_yield / 252.0
+    
+    # Cost parameters (approx)
+    cost_fee = 40
+    cost_tax = 2e-5
+    cost_slippage = 1
+    
+    for i in range(len(df)):
+        date = df.index[i]
+        price_taiex = df['TAIEX'].iloc[i]
+        price_00878 = df['00878'].iloc[i]
+        
+        # 1. Update Equity from Price Changes
+        if i > 0:
+            prev_taiex = df['TAIEX'].iloc[i-1]
+            prev_00878 = df['00878'].iloc[i-1]
+            
+            # Futures PnL (Price Difference)
+            diff_pts = price_taiex - prev_taiex
+            price_pnl = held_contracts * diff_pts * 50
+            
+            # Futures Yield PnL (Backwardation/Dividend)
+            # Same logic as Strategy 3
+            yield_points = prev_taiex * daily_yield_rate
             yield_pnl = held_contracts * yield_points * 50
             
-            # Note: If Short, held_contracts is negative, so yield_pnl is negative (Paying dividend). Correct.
+            fut_pnl = price_pnl + yield_pnl
             
-            day_pnl = price_pnl + yield_pnl
-            equity += day_pnl
+            # 00878 PnL
+            if shares_00878 > 0 and not pd.isna(price_00878) and not pd.isna(prev_00878):
+                stock_pnl = shares_00878 * (price_00878 - prev_00878)
+            else:
+                stock_pnl = 0
+                
+            equity += (fut_pnl + stock_pnl)
+            cash += fut_pnl # Futures PnL settles to cash
+            # Stock PnL is unrealized until rebalance, but for Total Equity we add it.
             
-        # 2. Rebalance / Trade
-        # Target Notional = Equity * Leverage * Signal
-        # Signal determines direction.
-        # If Signal is 0 (no data), do nothing.
+        # Recalculate Equity based on components to be precise
+        current_00878_val = shares_00878 * price_00878 if (shares_00878 > 0 and not pd.isna(price_00878)) else 0
+        # Note: 'cash' here includes the futures margin deposit.
+        # So Total Equity = Cash + Stock Value.
+        total_equity = cash + current_00878_val
         
-        if signal != 0:
-            target_notional = equity * leverage * signal
-            # Target Contracts
-            # Round to nearest integer. 
-            # Note: TAIEX ~20000. 1 contract ~ 1,000,000.
-            if price > 0:
-                target_contracts = int(round(target_notional / (price * 50)))
+        # 2. Rebalance (Monthly)
+        curr_month = date.month
+        if i == 0 or (i > 0 and curr_month != last_month):
+            # Target Exposure
+            target_notional = total_equity * leverage
+            
+            if price_taiex > 0:
+                target_contracts = int(round(target_notional / (price_taiex * 50)))
             else:
                 target_contracts = 0
-        else:
-            target_contracts = 0
             
-        # Check if trade needed
-        if target_contracts != held_contracts:
-            contracts_diff = target_contracts - held_contracts
-            abs_diff = abs(contracts_diff)
+            # Calculate Cash needed for Futures (Risk Management)
+            # Required Margin = Contracts * Margin
+            # Target Cash in Futures Account = Required Margin * Risk Ratio
+            req_margin = target_contracts * margin_per_contract
+            target_futures_cash = req_margin * target_risk_ratio
             
-            # Cost
-            # Tax: Based on Notional of Trade? No, Futures tax is based on Contract Value.
-            # Tax = Price * 50 * Contracts * Rate
-            tax = price * 50 * abs_diff * cost_tax
-            fee = abs_diff * cost_fee
-            slip = abs_diff * cost_slippage * 50
+            # Remaining for 00878
+            if total_equity < req_margin:
+                # Not enough money even for 1x margin
+                target_contracts = int(total_equity / margin_per_contract)
+                target_futures_cash = total_equity
+                target_00878_val = 0
+                note = "資金不足(降槓桿)"
+            else:
+                # We have enough for margin.
+                if total_equity < target_futures_cash:
+                    # Not enough for 300% risk, but enough for margin.
+                    # Put all in cash to be safe(r).
+                    target_futures_cash = total_equity
+                    target_00878_val = 0
+                    note = "風險指標不足(全現金)"
+                else:
+                    # We have excess.
+                    target_00878_val = total_equity - target_futures_cash
+                    note = "正常平衡"
             
-            total_cost = tax + fee + slip
-            equity -= total_cost
-            
+            # Execute Rebalance
+            prev_contracts = held_contracts
             held_contracts = target_contracts
+            
+            # Futures Cost
+            diff_contracts = held_contracts - prev_contracts
+            if diff_contracts != 0:
+                f_cost = abs(diff_contracts) * (cost_fee + cost_tax * price_taiex * 50 + cost_slippage * 50)
+                cash -= f_cost
+                total_cost_accum += f_cost
+            
+            # 00878
+            prev_shares = shares_00878
+            if target_00878_val > 0 and not pd.isna(price_00878):
+                shares_00878 = target_00878_val / price_00878
+                cash = target_futures_cash # The rest is in stock
+            else:
+                shares_00878 = 0
+                cash = total_equity # All cash
+            
+            # 00878 Cost (Simple 0.1425% * 0.6 + 0.3% Tax for Sell)
+            diff_shares = shares_00878 - prev_shares
+            if diff_shares != 0 and not pd.isna(price_00878):
+                val_trade = abs(diff_shares) * price_00878
+                fee = val_trade * 0.001425 * 0.6
+                tax = val_trade * 0.003 if diff_shares < 0 else 0
+                s_cost = fee + tax
+                cash -= s_cost
+                total_cost_accum += s_cost
+                
+            # Log
+            rebalance_log.append({
+                '日期': date.strftime('%Y-%m-%d'),
+                '總資產': int(total_equity),
+                '加權指數': int(price_taiex),
+                '目標曝險': int(target_notional),
+                '期貨口數': int(held_contracts),
+                '期貨變動': int(held_contracts - prev_contracts),
+                '保留現金(期貨)': int(cash),
+                '00878股價': f"{price_00878:.2f}" if not pd.isna(price_00878) else "N/A",
+                '00878股數': int(shares_00878),
+                '00878變動': int(shares_00878 - prev_shares),
+                '備註': note
+            })
+        
+        last_month = curr_month
+        
+        equity_arr.append(total_equity)
+        cash_arr.append(cash)
+        held_00878_val_arr.append(shares_00878 * price_00878 if not pd.isna(price_00878) else 0)
+        
+    df['Total_Equity'] = equity_arr
+    df['Cash_Pos'] = cash_arr
+    df['Stock_Pos'] = held_00878_val_arr
+    df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
+    
+    return df, pd.DataFrame(rebalance_log), total_cost_accum
+
+
+# --- 6. Pure 00878 Buy & Hold ---
+def run_backtest_00878_only(df_data, initial_capital):
+    df = df_data.copy()
+    
+    # Find first valid date for 00878
+    first_valid_idx = df['00878'].first_valid_index()
+    
+    equity_arr = []
+    log = []
+    
+    shares = 0
+    cash = initial_capital
+    has_bought = False
+    total_cost_accum = 0
+    
+    for i in range(len(df)):
+        date = df.index[i]
+        price = df['00878'].iloc[i]
+        
+        # Buy on first valid day
+        if not has_bought and not pd.isna(price) and price > 0:
+            shares = int(cash / price)
+            cost = shares * price
+            
+            # Transaction Cost
+            fee = cost * 0.001425 * 0.6
+            total_cost_accum += fee
+            
+            cash -= (cost + fee)
+            has_bought = True
+            
+            log.append({
+                '日期': date.strftime('%Y-%m-%d'),
+                '動作': '買進持有',
+                '價格': f"{price:.2f}",
+                '股數': shares,
+                '成本': int(cost),
+                '剩餘現金': int(cash)
+            })
+            
+        # Calculate Equity
+        if has_bought and not pd.isna(price):
+            equity = shares * price + cash
+        else:
+            equity = initial_capital # Still holding cash
             
         equity_arr.append(equity)
         
     df['Total_Equity'] = equity_arr
-    df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
-    
-    return df
+    return df, pd.DataFrame(log), total_cost_accum
+
 def render_original_strategy_page(df):
     # This logic matches lines 530+ of the backup, restored fully
     initial_capital = st.sidebar.number_input("初始總資金 (TWD)", value=1000000, step=100000)
@@ -375,7 +668,8 @@ def render_original_strategy_page(df):
     )
     
     # Tabs - Restoring ALL 7 Tabs
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📊 總覽", "📈 績效分析", "📅 週期分析", "📋 交易明細", "🔭 最新訊號判斷", "🎯 參數敏感度", "🎮 真實操作模擬"])
+    # Tabs - Restoring ALL Tabs + New Comparison Tab
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 總覽", "📈 績效分析", "📅 週期分析", "📋 交易明細", "🔭 最新訊號判斷", "🎯 參數敏感度", "🎮 真實操作模擬", "⚔️ 策略綜合比較"])
     
     with t1:
         st.subheader("回測結果總覽")
@@ -939,21 +1233,12 @@ def render_original_strategy_page(df):
             else:
                 st.success("風險指標安全。")
 
+    # New Tab: Comparison
+    with t8:
+        render_comparison_page(df)
+
 # --- Render Function: New Strategy ---
-def render_rebalance_page(df):
-    st.subheader("資產平衡策略")
-    c1, c2 = st.columns(2)
-    cap = c1.number_input("初始資金", 1000000, step=100000)
-    alloc = c2.slider("00631L 比例 (%)", 10, 90, 50, 5) / 100.0
-    
-    if st.button("回測"):
-        res = run_backtest_rebalance(df, cap, alloc)
-        fin = res['Total_Equity'].iloc[-1]
-        r = (fin - cap)/cap
-        c1, c2 = st.columns(2)
-        c1.metric("期末資產", f"{fin:,.0f}")
-        c2.metric("報酬率", f"{r:.2%}")
-        st.line_chart(res[['Total_Equity', 'Benchmark']])
+# Removed Rebalance Page as requested
 
 # --- Render Function: Comparison ---
 def render_comparison_page(df):
@@ -984,29 +1269,61 @@ def render_comparison_page(df):
             fut_lev = st.slider("期貨槓桿倍數 (X)", 1.0, 5.0, 2.0, 0.5, key='comp_fut_lev')
             st.caption(f"原始資金 {cap:,.0f}，目標曝險 {cap*fut_lev:,.0f}")
             
-            ma_trend = st.number_input("趨勢策略均線 (MA)", min_value=5, max_value=200, value=60, step=1, key='comp_ma_trend')
+            ma_trend = st.number_input("趨勢策略均線 (MA)", min_value=5, max_value=200, value=13, step=1, key='comp_ma_trend')
             st.caption(f"大於 {ma_trend}MA 做多，小於則做空")
             
             st.divider()
             div_yield = st.slider("預估年化逆價差/殖利率 (%)", 0.0, 10.0, 4.0, 0.5, key='comp_div_yield') / 100.0
             st.caption(f"模擬期貨逆價差帶來的額外收益 (預設 4%)")
+            
+            ignore_short_yield = st.checkbox("做空不計逆價差成本 (測試用)", value=False)
+            
+            st.divider()
+            st.markdown("#### 7. 純期貨 (波段做多)")
+            ma_long = st.number_input("波段做多均線 (MA)", min_value=5, max_value=200, value=13, step=1, key='comp_ma_long')
+            st.caption(f"大於 {ma_long}MA 做多，跌破則平倉 (不放空)")
+
+        with st.expander("策略 5: 期貨 + 00878 (New)", expanded=True):
+            st.markdown("#### 5. 期貨槓桿 + 00878 現金管理")
+            st.caption("利用期貨達成槓桿曝險，剩餘現金買入 00878 領息")
+            
+            col_f8_1, col_f8_2 = st.columns(2)
+            f8_lev = col_f8_1.slider("期貨槓桿 (X)", 1.0, 4.0, 2.0, 0.5, key='f8_lev')
+            f8_risk = col_f8_2.number_input("目標風險指標 (%)", value=300, step=50, key='f8_risk') / 100.0
+            
+            st.info(f"邏輯：目標 {f8_lev}倍大盤曝險。保留「保證金 x {f8_risk:.0%}」之現金於期貨戶，其餘買入 00878。")
+
+    if 'show_comparison' not in st.session_state:
+        st.session_state['show_comparison'] = False
 
     if st.button("開始比較", type="primary"):
+        st.session_state['show_comparison'] = True
+        
+    if st.session_state['show_comparison']:
         # 1. Futures (Uses user params)
-        df_f, _, _, _, _ = run_backtest_original(
+        df_f, trades_f, _, _, cost_f = run_backtest_original(
             df, 13, cap, f_long_pct, 1-f_long_pct, 85000, 
             '完全避險 (Neutral Hedge)', True, f_long_pct, 
             40, 2e-5, 1, True
         )
         
         # 2. Rebalance (Uses user params)
-        df_r = run_backtest_rebalance(df, cap, r_long_pct)
+        df_r, log_r, cost_r = run_backtest_rebalance(df, cap, r_long_pct)
         
         # 3. Pure Futures Long
-        df_fl = run_backtest_futures_simple(df, cap, fut_lev, 'Long-Only', 0, dividend_yield=div_yield)
+        df_fl, log_fl, cost_fl = run_backtest_futures_simple(df, cap, fut_lev, 'Long-Only', 0, dividend_yield=div_yield)
         
         # 4. Futures Trend
-        df_ft = run_backtest_futures_simple(df, cap, fut_lev, 'Trend', ma_trend, dividend_yield=div_yield)
+        df_ft, log_ft, cost_ft = run_backtest_futures_simple(df, cap, fut_lev, 'Trend', ma_trend, dividend_yield=div_yield, ignore_short_yield=ignore_short_yield)
+        
+        # 5. Futures + 00878
+        df_f8, log_f8, cost_f8 = run_backtest_futures_00878(df, cap, f8_lev, 85000, f8_risk, dividend_yield=div_yield)
+        
+        # 6. Pure 00878 Buy & Hold
+        df_8only, log_8only, cost_8only = run_backtest_00878_only(df, cap)
+        
+        # 7. Futures Long-MA
+        df_fma, log_fma, cost_fma = run_backtest_futures_simple(df, cap, fut_lev, 'Long-MA', ma_long, dividend_yield=div_yield)
         
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_f.index, y=df_f['Benchmark'], name='Buy&Hold 00631L', line=dict(color='gray', width=2)))
@@ -1014,6 +1331,9 @@ def render_comparison_page(df):
         fig.add_trace(go.Scatter(x=df_r.index, y=df_r['Total_Equity'], name=f'資產平衡 (00631L {r_long_pct:.0%})', line=dict(color='blue', width=2)))
         fig.add_trace(go.Scatter(x=df_fl.index, y=df_fl['Total_Equity'], name=f'純期貨做多 ({fut_lev}x)', line=dict(color='orange', width=2, dash='dot')))
         fig.add_trace(go.Scatter(x=df_ft.index, y=df_ft['Total_Equity'], name=f'純期貨趨勢 ({fut_lev}x) MA{ma_trend}', line=dict(color='purple', width=2, dash='dot')))
+        fig.add_trace(go.Scatter(x=df_f8.index, y=df_f8['Total_Equity'], name=f'期貨({f8_lev}x) + 00878', line=dict(color='#00C853', width=3)))
+        fig.add_trace(go.Scatter(x=df_8only.index, y=df_8only['Total_Equity'], name='Buy & Hold 00878', line=dict(color='#00897B', width=2)))
+        fig.add_trace(go.Scatter(x=df_fma.index, y=df_fma['Total_Equity'], name=f'純期貨波段 ({fut_lev}x) MA{ma_long}', line=dict(color='#FFD600', width=2)))
         
         fig.update_layout(
             title='策略績效與資產曲線比較 (含逆價差調整)',
@@ -1029,16 +1349,27 @@ def render_comparison_page(df):
         # Table
         data = []
         strategies = [
-            ('Buy&Hold 00631L', '100% 持有', df_f['Benchmark']), 
-            ('期貨避險策略', f'00631L {f_long_pct:.0%} / 現金 {1-f_long_pct:.0%}', df_f['Total_Equity']), 
-            ('資產平衡策略', f'00631L {r_long_pct:.0%} / 現金 {1-r_long_pct:.0%}', df_r['Total_Equity']),
-            ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity']),
-            ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'])
+            ('Buy&Hold 00631L', '100% 持有', df_f['Benchmark'], 0), 
+            ('期貨避險策略', f'00631L {f_long_pct:.0%} / 現金 {1-f_long_pct:.0%}', df_f['Total_Equity'], cost_f), 
+            ('資產平衡策略', f'00631L {r_long_pct:.0%} / 現金 {1-r_long_pct:.0%}', df_r['Total_Equity'], cost_r),
+            ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity'], cost_fl),
+            ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'], cost_ft),
+            ('期貨 + 00878', f'槓桿 {f8_lev}x / 風險指標 {f8_risk:.0%}', df_f8['Total_Equity'], cost_f8),
+            ('單純持有 00878', '100% 持有 (2020/7上市)', df_8only['Total_Equity'], cost_8only),
+            ('純期貨 (波段做多)', f'槓桿 {fut_lev}x / MA{ma_long}', df_fma['Total_Equity'], cost_fma)
         ]
         
-        for name, param, d in strategies:
+        for name, param, d, cost in strategies:
             final_val = d.iloc[-1]
             ret = (final_val - cap) / cap
+            
+            # CAGR
+            days = (d.index[-1] - d.index[0]).days
+            years = days / 365.25
+            if years > 0:
+                cagr = (final_val / cap) ** (1 / years) - 1
+            else:
+                cagr = 0
             
             # MDD
             roll_max = d.cummax()
@@ -1049,11 +1380,194 @@ def render_comparison_page(df):
                 '策略名稱': name,
                 '參數設定': param,
                 '總報酬率': f"{ret:.2%}", 
+                '年化報酬率 (CAGR)': f"{cagr:.2%}",
                 '最大回撤 (MDD)': f"{mdd:.2%}", 
+                '總交易成本': f"{cost:,.0f}",
                 '期末總資產': f"{final_val:,.0f}"
             })
             
         st.table(pd.DataFrame(data))
+        
+
+        
+        # --- Detailed Strategy View (Buy/Sell Points) ---
+        st.subheader("🔍 策略買賣點詳情")
+        
+        # Map strategy names to their logs
+        strategy_logs = {
+            '純期貨做多': log_fl,
+            '純期貨趨勢 (多空)': log_ft,
+            '純期貨 (波段做多)': log_fma,
+            '期貨避險策略': pd.DataFrame(trades_f) if trades_f else pd.DataFrame(),
+            '資產平衡策略': log_r,
+            '期貨 + 00878': log_f8,
+            '單純持有 00878': log_8only
+        }
+        
+        selected_strategy = st.selectbox("選擇要查看買賣點的策略", list(strategy_logs.keys()), index=1)
+        
+        if selected_strategy:
+            detail_log = strategy_logs[selected_strategy]
+            
+            if not detail_log.empty:
+                # Create Figure
+                fig_detail = go.Figure()
+                
+                # 1. Base Price Line (TAIEX or 00878 depending on strategy)
+                if '00878' in selected_strategy:
+                    # For 00878 strategies, maybe show 00878 price? 
+                    # But most actions are based on TAIEX or rebalancing.
+                    # Let's show TAIEX for consistency, or 00878 for Pure 00878.
+                    if selected_strategy == '單純持有 00878':
+                        fig_detail.add_trace(go.Scatter(x=df.index, y=df['00878'], name='00878 股價', line=dict(color='gray', width=1)))
+                        price_col = '價格'
+                    else:
+                        fig_detail.add_trace(go.Scatter(x=df.index, y=df['TAIEX'], name='加權指數', line=dict(color='gray', width=1)))
+                        price_col = '指數'
+                else:
+                    fig_detail.add_trace(go.Scatter(x=df.index, y=df['TAIEX'], name='加權指數', line=dict(color='gray', width=1)))
+                    price_col = '指數'
+                    
+                # 2. Add Markers
+                # Filter actions
+                # Common actions: 新倉 (多/空), 平倉, 反手, 加碼, 減碼
+                # Trades log (Strategy 1) has different format: 進場日期, 出場日期...
+                
+                if selected_strategy == '期貨避險策略':
+                    # Handle Strategy 1 (Trades format)
+                    # Plot Entries
+                    fig_detail.add_trace(go.Scatter(
+                        x=detail_log['進場日期'], 
+                        y=detail_log['進場指數'],
+                        mode='markers',
+                        name='進場 (空單)',
+                        marker=dict(symbol='triangle-down', size=10, color='red')
+                    ))
+                    # Plot Exits
+                    fig_detail.add_trace(go.Scatter(
+                        x=detail_log['出場日期'], 
+                        y=detail_log['出場指數'],
+                        mode='markers',
+                        name='出場 (平倉)',
+                        marker=dict(symbol='x', size=8, color='black')
+                    ))
+                else:
+                    # Handle Standard Logs
+                    # Check if '動作' column exists
+                    if '動作' in detail_log.columns:
+                        # Define colors/symbols
+                        # Long Entries: Green Triangle Up
+                        # Short Entries: Red Triangle Down
+                        # Close: Black X
+                        # Reduce: Orange Circle
+                        
+                        # Helper to filter
+                        def get_mask(keyword):
+                            return detail_log['動作'].str.contains(keyword, na=False)
+                        
+                        # Longs (New, Add, Reverse Long)
+                        mask_long = get_mask('多') & (get_mask('新倉') | get_mask('加碼') | get_mask('反手'))
+                        if mask_long.any():
+                            fig_detail.add_trace(go.Scatter(
+                                x=pd.to_datetime(detail_log[mask_long]['日期']),
+                                y=detail_log[mask_long][price_col] if price_col in detail_log.columns else detail_log[mask_long]['成交價'],
+                                mode='markers',
+                                name='做多/加碼',
+                                marker=dict(symbol='triangle-up', size=10, color='green')
+                            ))
+                            
+                        # Shorts (New, Add, Reverse Short)
+                        mask_short = get_mask('空') & (get_mask('新倉') | get_mask('加碼') | get_mask('反手'))
+                        if mask_short.any():
+                            fig_detail.add_trace(go.Scatter(
+                                x=pd.to_datetime(detail_log[mask_short]['日期']),
+                                y=detail_log[mask_short][price_col] if price_col in detail_log.columns else detail_log[mask_short]['成交價'],
+                                mode='markers',
+                                name='做空/加碼',
+                                marker=dict(symbol='triangle-down', size=10, color='red')
+                            ))
+                            
+                        # Close
+                        mask_close = get_mask('平倉')
+                        if mask_close.any():
+                            fig_detail.add_trace(go.Scatter(
+                                x=pd.to_datetime(detail_log[mask_close]['日期']),
+                                y=detail_log[mask_close][price_col] if price_col in detail_log.columns else detail_log[mask_close]['成交價'],
+                                mode='markers',
+                                name='平倉',
+                                marker=dict(symbol='x', size=8, color='black')
+                            ))
+                            
+                        # Reduce
+                        mask_reduce = get_mask('減碼')
+                        if mask_reduce.any():
+                            fig_detail.add_trace(go.Scatter(
+                                x=pd.to_datetime(detail_log[mask_reduce]['日期']),
+                                y=detail_log[mask_reduce][price_col] if price_col in detail_log.columns else detail_log[mask_reduce]['成交價'],
+                                mode='markers',
+                                name='減碼',
+                                marker=dict(symbol='circle', size=8, color='orange')
+                            ))
+                            
+                        # Rebalance (Strategy 2)
+                        mask_rebal = get_mask('再平衡')
+                        if mask_rebal.any():
+                             fig_detail.add_trace(go.Scatter(
+                                x=pd.to_datetime(detail_log[mask_rebal]['日期']),
+                                y=detail_log[mask_rebal]['成交價'], # 00631L Price
+                                mode='markers',
+                                name='再平衡',
+                                marker=dict(symbol='circle', size=6, color='blue')
+                            ))
+                            
+                        # Buy & Hold (Strategy 6)
+                        mask_buy = get_mask('買進持有')
+                        if mask_buy.any():
+                             fig_detail.add_trace(go.Scatter(
+                                x=pd.to_datetime(detail_log[mask_buy]['日期']),
+                                y=detail_log[mask_buy]['價格'],
+                                mode='markers',
+                                name='買進',
+                                marker=dict(symbol='triangle-up', size=12, color='green')
+                            ))
+
+                fig_detail.update_layout(
+                    title=f'{selected_strategy} - 買賣點分佈',
+                    xaxis_title='日期',
+                    yaxis_title='指數 / 價格',
+                    hovermode='closest',
+                    template="plotly_white",
+                    height=500
+                )
+                st.plotly_chart(fig_detail, use_container_width=True)
+            else:
+                st.info("此策略無交易紀錄")
+
+        st.subheader("📋 各策略詳細交易紀錄")
+        
+        with st.expander("1. 期貨避險策略 - 交易明細"):
+            if trades_f:
+                st.dataframe(pd.DataFrame(trades_f), use_container_width=True)
+            else:
+                st.info("無交易紀錄")
+                
+        with st.expander("2. 資產平衡策略 - 再平衡紀錄"):
+            st.dataframe(log_r, use_container_width=True)
+            
+        with st.expander("3. 純期貨做多 - 交易紀錄"):
+            st.dataframe(log_fl, use_container_width=True)
+            
+        with st.expander("4. 純期貨趨勢 - 交易紀錄"):
+            st.dataframe(log_ft, use_container_width=True)
+            
+        with st.expander("5. 期貨 + 00878 - 詳細紀錄"):
+            st.dataframe(log_f8, use_container_width=True)
+            
+        with st.expander("6. 單純持有 00878 - 交易紀錄"):
+            st.dataframe(log_8only, use_container_width=True)
+            
+        with st.expander("7. 純期貨 (波段做多) - 交易紀錄"):
+            st.dataframe(log_fma, use_container_width=True)
 
 # --- Main Flow ---
 st.sidebar.header("資料來源")
@@ -1072,7 +1586,15 @@ if dt_src == "Yahoo Finance":
         if isinstance(d2.columns, pd.MultiIndex): d2.columns = d2.columns.droplevel(1)
         d1 = d1[['Close']].rename(columns={'Close': '00631L'})
         d2 = d2[['Close']].rename(columns={'Close': 'TAIEX'})
+        
+        # Download 00878 (Explicitly use auto_adjust=True to include dividends in Close)
+        d3 = yf.download("00878.TW", start="2020-07-01", progress=False, auto_adjust=True)
+        if isinstance(d3.columns, pd.MultiIndex): d3.columns = d3.columns.droplevel(1)
+        d3 = d3[['Close']].rename(columns={'Close': '00878'})
+        
         df_g = pd.merge(d1, d2, left_index=True, right_index=True)
+        # Left join 00878 (it has shorter history)
+        df_g = pd.merge(df_g, d3, left_index=True, right_index=True, how='left')
         st.sidebar.success("Yahoo Download OK")
     except:
         st.sidebar.error("Yahoo Error")
@@ -1089,6 +1611,13 @@ else:
             d[dc] = pd.to_datetime(d[dc])
             return d[[dc, pc]].rename(columns={dc:'Date', pc:n}).set_index('Date')
         df_g = pd.merge(cl(d1, '00631L'), cl(d2, 'TAIEX'), left_index=True, right_index=True)
+        
+        # Try load 00878 from file if exists, else fill NaN
+        if os.path.exists("00878.xlsx"):
+             d3 = pd.read_excel("00878.xlsx")
+             df_g = pd.merge(df_g, cl(d3, '00878'), left_index=True, right_index=True, how='left')
+        else:
+             df_g['00878'] = np.nan
         st.sidebar.success("Local File Loaded")
 
 if df_g is not None and not df_g.empty:
@@ -1115,16 +1644,13 @@ if df_g is not None and not df_g.empty:
                 df_test_raw = df_g.loc[mask].copy()
 
                 st.sidebar.markdown("---")
-                page = st.sidebar.radio("功能選擇", ["期貨避險策略 (Original)", "資產平衡策略 (New)", "策略綜合比較"])
+                
+                # Consolidate views - Directly render the main strategy page (which now includes Comparison as a tab)
+                render_original_strategy_page(df_test_raw)
 
-                if page == "期貨避險策略 (Original)":
-                    render_original_strategy_page(df_test_raw)
-                elif page == "資產平衡策略 (New)":
-                    render_rebalance_page(df_test_raw)
-                elif page == "策略綜合比較":
-                    render_comparison_page(df_test_raw)
             else:
                 st.info("請選擇完整的開始與結束日期")
+
 elif df_g is not None and df_g.empty:
     st.warning("下載或讀取的資料為空，無法進行回測。")
 else:
