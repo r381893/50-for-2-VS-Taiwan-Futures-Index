@@ -22,6 +22,29 @@ def get_dividend_00878(date_str):
     """取得指定日期的 00878 股息"""
     return DIVIDEND_00878.get(date_str, 0)
 
+# =============================================================================
+# 00631L 股息資料 (年配息，通常在除息後價格會調整)
+# =============================================================================
+# 注意：yfinance 使用 auto_adjust=True 時，價格已經包含股利調整
+# 這個資料用於顯示歷史配息記錄，不用於回測計算（已反映在調整後價格）
+DIVIDEND_00631L = {
+    # 年度: 配息金額 (每股)
+    '2016-10-24': 0.23,
+    '2017-10-23': 0.88,
+    '2018-10-22': 1.95,
+    '2019-10-21': 0.05,
+    '2020-10-19': 0.00,  # 2020 無配息
+    '2021-10-18': 2.00,
+    '2022-10-17': 3.30,
+    '2023-10-16': 2.13,
+    '2024-10-21': 3.75,
+}
+
+def get_dividend_00631L(date_str):
+    """取得指定日期的 00631L 股息"""
+    return DIVIDEND_00631L.get(date_str, 0)
+
+
 st.set_page_config(page_title="台灣五十正2 & 小台 Backtest", layout="wide")
 st.title("台灣五十正2 (00631L) & 小台指 策略回測平台")
 
@@ -486,13 +509,22 @@ def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_co
             
             fut_pnl = price_pnl + yield_pnl
             
-            # 00878 PnL
+            # 00878 PnL (Price Change)
             if shares_00878 > 0 and not pd.isna(price_00878) and not pd.isna(prev_00878):
                 stock_pnl = shares_00878 * (price_00878 - prev_00878)
             else:
                 stock_pnl = 0
+            
+            # 00878 Dividend Income (check if today is ex-dividend date)
+            date_str = date.strftime('%Y-%m-%d')
+            if shares_00878 > 0 and date_str in DIVIDEND_00878:
+                dividend_per_share = DIVIDEND_00878[date_str]
+                dividend_income = shares_00878 * dividend_per_share
+                cash += dividend_income  # Dividend goes to cash
+            else:
+                dividend_income = 0
                 
-            equity += (fut_pnl + stock_pnl)
+            equity += (fut_pnl + stock_pnl + dividend_income)
             cash += fut_pnl # Futures PnL settles to cash
             # Stock PnL is unrealized until rebalance, but for Total Equity we add it.
             
@@ -598,8 +630,16 @@ def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_co
     return df, pd.DataFrame(rebalance_log), total_cost_accum
 
 
-# --- 6. Pure 00878 Buy & Hold ---
-def run_backtest_00878_only(df_data, initial_capital):
+# --- 6. Pure 00878 Buy & Hold (with Dividend) ---
+def run_backtest_00878_only(df_data, initial_capital, reinvest_dividend=True):
+    """
+    00878 純持有策略 (含股利計算)
+    
+    Args:
+        df_data: 包含 00878 價格的 DataFrame
+        initial_capital: 初始資金
+        reinvest_dividend: 是否將股利再投入 (預設: 是)
+    """
     df = df_data.copy()
     
     # Find first valid date for 00878
@@ -612,9 +652,11 @@ def run_backtest_00878_only(df_data, initial_capital):
     cash = initial_capital
     has_bought = False
     total_cost_accum = 0
+    total_dividend_received = 0
     
     for i in range(len(df)):
         date = df.index[i]
+        date_str = date.strftime('%Y-%m-%d')
         price = df['00878'].iloc[i]
         
         # Buy on first valid day
@@ -630,13 +672,53 @@ def run_backtest_00878_only(df_data, initial_capital):
             has_bought = True
             
             log.append({
-                '日期': date.strftime('%Y-%m-%d'),
+                '日期': date_str,
                 '動作': '買進持有',
                 '價格': f"{price:.2f}",
                 '股數': shares,
                 '成本': int(cost),
+                '股利收入': 0,
                 '剩餘現金': int(cash)
             })
+        
+        # Check for dividend payment
+        if has_bought and date_str in DIVIDEND_00878:
+            dividend_per_share = DIVIDEND_00878[date_str]
+            dividend_income = shares * dividend_per_share
+            total_dividend_received += dividend_income
+            
+            if reinvest_dividend and not pd.isna(price) and price > 0:
+                # Reinvest dividend: buy more shares
+                new_shares = int(dividend_income / price)
+                reinvest_cost = new_shares * price
+                fee = reinvest_cost * 0.001425 * 0.6
+                total_cost_accum += fee
+                
+                shares += new_shares
+                cash += (dividend_income - reinvest_cost - fee)
+                
+                log.append({
+                    '日期': date_str,
+                    '動作': f'股利再投入 (每股 ${dividend_per_share:.2f})',
+                    '價格': f"{price:.2f}",
+                    '股數': new_shares,
+                    '成本': int(reinvest_cost),
+                    '股利收入': int(dividend_income),
+                    '剩餘現金': int(cash)
+                })
+            else:
+                # Keep dividend as cash
+                cash += dividend_income
+                
+                log.append({
+                    '日期': date_str,
+                    '動作': f'收取股利 (每股 ${dividend_per_share:.2f})',
+                    '價格': f"{price:.2f}",
+                    '股數': 0,
+                    '成本': 0,
+                    '股利收入': int(dividend_income),
+                    '剩餘現金': int(cash)
+                })
             
         # Calculate Equity
         if has_bought and not pd.isna(price):
@@ -647,7 +729,12 @@ def run_backtest_00878_only(df_data, initial_capital):
         equity_arr.append(equity)
         
     df['Total_Equity'] = equity_arr
-    return df, pd.DataFrame(log), total_cost_accum
+    
+    # Add summary to log
+    if log:
+        final_log_entry = log[-1].copy() if log else {}
+        
+    return df, pd.DataFrame(log), total_cost_accum, total_dividend_received
 
 # =============================================================================
 # 實戰資金配置計算器
@@ -1422,8 +1509,8 @@ def render_comparison_page(df):
         # 5. Futures + 00878
         df_f8, log_f8, cost_f8 = run_backtest_futures_00878(df, cap, f8_lev, 85000, f8_risk, dividend_yield=div_yield)
         
-        # 6. Pure 00878 Buy & Hold
-        df_8only, log_8only, cost_8only = run_backtest_00878_only(df, cap)
+        # 6. Pure 00878 Buy & Hold (with dividend reinvestment)
+        df_8only, log_8only, cost_8only, dividend_8only = run_backtest_00878_only(df, cap)
         
         # 7. Futures Long-MA
         df_fma, log_fma, cost_fma = run_backtest_futures_simple(df, cap, fut_lev, 'Long-MA', ma_long, dividend_yield=div_yield)
@@ -1501,7 +1588,7 @@ def render_comparison_page(df):
             ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity'], cost_fl),
             ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'], cost_ft),
             ('期貨 + 00878', f'槓桿 {f8_lev}x / 風險指標 {f8_risk:.0%}', df_f8['Total_Equity'], cost_f8),
-            ('單純持有 00878', '100% 持有 (2020/7上市)', df_8only['Total_Equity'], cost_8only),
+            ('單純持有 00878', f'100% 持有 (含股利再投入, 股利: ${dividend_8only:,.0f})', df_8only['Total_Equity'], cost_8only),
             ('純期貨 (波段做多)', f'槓桿 {fut_lev}x / MA{ma_long}', df_fma['Total_Equity'], cost_fma)
         ]
         
