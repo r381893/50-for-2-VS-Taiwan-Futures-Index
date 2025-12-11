@@ -259,6 +259,12 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
     
     # Simple cost model for rebalance
     cost_rate = 0.001425 * 0.6 + 0.001
+    total_cost_accum = 0  # Track transaction costs properly
+    
+    # Initial purchase cost
+    init_cost = alloc_00631 * cost_rate
+    cash -= init_cost
+    total_cost_accum += init_cost
     
     eq_arr, cash_arr = [], []
     log = []
@@ -272,7 +278,8 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
         '股數變動': int(shares),
         '持有股數': int(shares),
         '現金餘額': int(cash),
-        '總資產': int(initial_capital)
+        '總資產': int(initial_capital),
+        '交易成本': int(init_cost)
     })
     
     for i in range(len(df)):
@@ -289,6 +296,7 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
                 shares_diff = diff / price
                 shares += shares_diff
                 cash -= (diff + cost)
+                total_cost_accum += cost
                 
                 log.append({
                     '日期': df.index[i].strftime('%Y-%m-%d'),
@@ -297,7 +305,8 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
                     '股數變動': int(shares_diff),
                     '持有股數': int(shares),
                     '現金餘額': int(cash),
-                    '總資產': int(tot)
+                    '總資產': int(tot),
+                    '交易成本': int(cost)
                 })
         
         last_month = curr_month
@@ -308,12 +317,7 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
     df['Cash'] = cash_arr
     df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
     
-    # Calculate Total Cost
-    total_cost = initial_capital - df['Total_Equity'].iloc[-1] # This is wrong, equity change includes PnL.
-    # We need to track cost in the loop.
-    # Re-implementing loop tracking for cost.
-    
-    return df, pd.DataFrame(log), sum([x['交易成本'] for x in log if '交易成本' in x])
+    return df, pd.DataFrame(log), total_cost_accum
 
 # --- 3. Simple Futures Strategy (Long Only / Trend) ---
 def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_period, dividend_yield=0.04, cost_fee=40, cost_tax=2e-5, cost_slippage=1, ignore_short_yield=False):
@@ -469,7 +473,6 @@ def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_co
     # Fill 00878 NaN with 0 (or handle in loop)
     # Actually, if 00878 is NaN, we just hold Cash.
     
-    equity = initial_capital
     cash = initial_capital
     shares_00878 = 0
     held_contracts = 0
@@ -524,7 +527,6 @@ def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_co
             else:
                 dividend_income = 0
                 
-            equity += (fut_pnl + stock_pnl + dividend_income)
             cash += fut_pnl # Futures PnL settles to cash
             # Stock PnL is unrealized until rebalance, but for Total Equity we add it.
             
@@ -687,29 +689,48 @@ def run_backtest_00878_only(df_data, initial_capital, reinvest_dividend=True):
             dividend_income = shares * dividend_per_share
             total_dividend_received += dividend_income
             
+            # Add dividend to cash first (Accumulate)
+            cash += dividend_income
+            
             if reinvest_dividend and not pd.isna(price) and price > 0:
-                # Reinvest dividend: buy more shares
-                new_shares = int(dividend_income / price)
-                reinvest_cost = new_shares * price
-                fee = reinvest_cost * 0.001425 * 0.6
-                total_cost_accum += fee
+                # Reinvest: Try to buy shares with TOTAL available cash (Accumulated)
+                # Considering transaction cost: Price * Shares * (1 + FeeRate) <= Cash
+                # FeeRate = 0.001425 * 0.6 ~= 0.000855
+                cost_multiplier = 1 + (0.001425 * 0.6)
                 
-                shares += new_shares
-                cash += (dividend_income - reinvest_cost - fee)
+                # Max shares we can afford
+                can_buy_shares = int(cash / (price * cost_multiplier))
                 
-                log.append({
-                    '日期': date_str,
-                    '動作': f'股利再投入 (每股 ${dividend_per_share:.2f})',
-                    '價格': f"{price:.2f}",
-                    '股數': new_shares,
-                    '成本': int(reinvest_cost),
-                    '股利收入': int(dividend_income),
-                    '剩餘現金': int(cash)
-                })
+                if can_buy_shares > 0:
+                    reinvest_cost = can_buy_shares * price
+                    fee = reinvest_cost * 0.001425 * 0.6
+                    total_cost_accum += fee
+                    
+                    shares += can_buy_shares
+                    cash -= (reinvest_cost + fee)
+                    
+                    log.append({
+                        '日期': date_str,
+                        '動作': f'股利再投入 (每股 ${dividend_per_share:.2f})',
+                        '價格': f"{price:.2f}",
+                        '股數': int(can_buy_shares),
+                        '成本': int(reinvest_cost),
+                        '股利收入': int(dividend_income),
+                        '剩餘現金': int(cash)
+                    })
+                else:
+                    # Cash accumulated but not enough for 1 share + fee
+                    log.append({
+                        '日期': date_str,
+                        '動作': f'收取股利 (累積中) (每股 ${dividend_per_share:.2f})',
+                        '價格': f"{price:.2f}",
+                        '股數': 0,
+                        '成本': 0,
+                        '股利收入': int(dividend_income),
+                        '剩餘現金': int(cash)
+                    })
             else:
-                # Keep dividend as cash
-                cash += dividend_income
-                
+                # Not reinvesting, just keep in cash
                 log.append({
                     '日期': date_str,
                     '動作': f'收取股利 (每股 ${dividend_per_share:.2f})',
@@ -1551,48 +1572,40 @@ def render_comparison_page(df):
             '純期貨 (波段做多)': log_fma
         }
         
-        def calculate_profit_loss(log_df, strategy_name):
-            """Calculate total profit and total loss from trade log"""
+        def calculate_profit_loss(equity_series, initial_capital):
+            """Calculate total profit and total loss from equity curve (daily changes)"""
             total_profit = 0
             total_loss = 0
             
-            if log_df is None or log_df.empty:
+            if equity_series is None or len(equity_series) < 2:
                 return 0, 0
             
-            # Find profit/loss column
-            pnl_col = None
-            for col in ['獲利金額 (TWD)', '本筆損益', 'PnL']:
-                if col in log_df.columns:
-                    pnl_col = col
-                    break
+            # Calculate daily changes
+            daily_returns = equity_series.diff().dropna()
             
-            if pnl_col is None:
-                return 0, 0
-            
-            for val in log_df[pnl_col]:
-                try:
-                    num = float(val) if not pd.isna(val) else 0
-                    if num > 0:
-                        total_profit += num
-                    else:
-                        total_loss += num  # Already negative
-                except:
-                    pass
+            # Sum positive changes as profit, negative as loss
+            for change in daily_returns:
+                if change > 0:
+                    total_profit += change
+                elif change < 0:
+                    total_loss += change  # Already negative
             
             return total_profit, total_loss
         
+        # (name, param, equity_series, cost, is_buyhold)
+        # is_buyhold=True means no trading, so profit/loss columns should show '-'
         strategies = [
-            ('Buy&Hold 00631L', '100% 持有', df_f['Benchmark'], 0), 
-            ('期貨避險策略', f'00631L {f_long_pct:.0%} / 現金 {1-f_long_pct:.0%}', df_f['Total_Equity'], cost_f), 
-            ('資產平衡策略', f'00631L {r_long_pct:.0%} / 現金 {1-r_long_pct:.0%}', df_r['Total_Equity'], cost_r),
-            ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity'], cost_fl),
-            ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'], cost_ft),
-            ('期貨 + 00878', f'槓桿 {f8_lev}x / 風險指標 {f8_risk:.0%}', df_f8['Total_Equity'], cost_f8),
-            ('單純持有 00878', f'100% 持有 (含股利再投入, 股利: ${dividend_8only:,.0f})', df_8only['Total_Equity'], cost_8only),
-            ('純期貨 (波段做多)', f'槓桿 {fut_lev}x / MA{ma_long}', df_fma['Total_Equity'], cost_fma)
+            ('Buy&Hold 00631L', '100% 持有', df_f['Benchmark'], 0, True), 
+            ('期貨避險策略', f'00631L {f_long_pct:.0%} / 現金 {1-f_long_pct:.0%}', df_f['Total_Equity'], cost_f, False), 
+            ('資產平衡策略', f'00631L {r_long_pct:.0%} / 現金 {1-r_long_pct:.0%}', df_r['Total_Equity'], cost_r, False),
+            ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity'], cost_fl, False),
+            ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'], cost_ft, False),
+            ('期貨 + 00878', f'槓桿 {f8_lev}x / 風險指標 {f8_risk:.0%}', df_f8['Total_Equity'], cost_f8, False),
+            ('單純持有 00878', f'100% 持有 (含股利再投入, 股利: ${dividend_8only:,.0f})', df_8only['Total_Equity'], cost_8only, True),
+            ('純期貨 (波段做多)', f'槓桿 {fut_lev}x / MA{ma_long}', df_fma['Total_Equity'], cost_fma, False)
         ]
         
-        for name, param, d, cost in strategies:
+        for name, param, d, cost, is_buyhold in strategies:
             final_val = d.iloc[-1]
             ret = (final_val - cap) / cap
             
@@ -1609,9 +1622,12 @@ def render_comparison_page(df):
             drawdown = (d - roll_max) / roll_max
             mdd = drawdown.min()
             
-            # Calculate Total Profit and Loss
-            log_df = strategy_logs_map.get(name)
-            total_profit, total_loss = calculate_profit_loss(log_df, name)
+            # Calculate Total Profit and Loss from equity curve
+            # For buy-and-hold strategies, show None (will display as '-')
+            if is_buyhold:
+                total_profit, total_loss = None, None
+            else:
+                total_profit, total_loss = calculate_profit_loss(d, cap)
             
             data.append({
                 '策略名稱': name,
@@ -1645,8 +1661,8 @@ def render_comparison_page(df):
         df_display['總報酬率'] = df_display['總報酬率'].apply(lambda x: f"{x:.2%}")
         df_display['年化報酬率 (CAGR)'] = df_display['年化報酬率 (CAGR)'].apply(lambda x: f"{x:.2%}")
         df_display['最大回撤 (MDD)'] = df_display['最大回撤 (MDD)'].apply(lambda x: f"{x:.2%}")
-        df_display['總獲利'] = df_display['總獲利'].apply(lambda x: f"{x:,.0f}" if x != 0 else "-")
-        df_display['總虧損'] = df_display['總虧損'].apply(lambda x: f"{x:,.0f}" if x != 0 else "-")
+        df_display['總獲利'] = df_display['總獲利'].apply(lambda x: f"{x:,.0f}" if pd.notna(x) and x != 0 else "-")
+        df_display['總虧損'] = df_display['總虧損'].apply(lambda x: f"{x:,.0f}" if pd.notna(x) and x != 0 else "-")
         df_display['總交易成本'] = df_display['總交易成本'].apply(lambda x: f"{x:,.0f}")
         df_display['期末總資產'] = df_display['期末總資產'].apply(lambda x: f"{x:,.0f}")
         
