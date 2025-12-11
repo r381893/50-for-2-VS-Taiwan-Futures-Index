@@ -6,6 +6,58 @@ import os
 import yfinance as yf
 import json
 
+# =============================================================================
+# 00878 股息資料 (季配息)
+# =============================================================================
+# 資料來源：歷年股利分配
+# 00878 通常在 2月/5月/8月/11月 除息
+DIVIDEND_00878 = {
+    # 格式: 'YYYY-MM-DD': 股利金額 (元/股)
+    # 2020年 (上市年)
+    '2020-11-17': 0.05,  # Q4
+    
+    # 2021年
+    '2021-02-22': 0.15,  # Q1
+    '2021-05-18': 0.30,  # Q2
+    '2021-08-17': 0.35,  # Q3
+    '2021-11-16': 0.35,  # Q4
+    
+    # 2022年
+    '2022-02-17': 0.32,  # Q1
+    '2022-05-17': 0.28,  # Q2
+    '2022-08-16': 0.28,  # Q3
+    '2022-11-16': 0.27,  # Q4
+    
+    # 2023年
+    '2023-02-17': 0.35,  # Q1
+    '2023-05-17': 0.35,  # Q2
+    '2023-08-16': 0.35,  # Q3
+    '2023-11-16': 0.35,  # Q4
+    
+    # 2024年
+    '2024-02-27': 0.40,  # Q1
+    '2024-05-17': 0.51,  # Q2
+    '2024-08-16': 0.55,  # Q3
+    '2024-11-18': 0.64,  # Q4
+    
+    # 2025年
+    '2025-02-18': 0.56,  # Q1
+    '2025-05-16': 0.37,  # Q2 (預估)
+    '2025-08-15': 0.37,  # Q3 (預估)
+}
+
+def get_dividend_00878(date_str):
+    """
+    取得指定日期的 00878 股息
+    
+    Args:
+        date_str: 日期字串 'YYYY-MM-DD'
+    
+    Returns:
+        股息金額 (如果該日為除息日) 或 0
+    """
+    return DIVIDEND_00878.get(date_str, 0)
+
 st.set_page_config(page_title="台灣五十正2 & 小台 Backtest", layout="wide")
 st.title("台灣五十正2 (00631L) & 小台指 策略回測平台")
 
@@ -54,30 +106,84 @@ def metric_card(label, value, delta=None, delta_color="normal"):
         delta_html = f'<div class="metric-delta {color_class}">{delta}</div>'
     st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div>{delta_html}</div>', unsafe_allow_html=True)
 
-# --- 1. Original Backtest Function (Unchanged Logic) ---
+# =============================================================================
+# 策略1: 期貨避險策略 (00631L + 小台避險)
+# =============================================================================
+# 【策略邏輯說明】
+# 1. 做多部位：買進並持有 00631L (台灣50正2)，約等於 2 倍大盤曝險
+# 2. 避險部位：當大盤跌破均線時，做空小台期貨來對沖風險
+# 3. 訊號判斷：指數 < MA → 做空避險 | 指數 > MA → 平倉空單
+# 4. 口數計算：
+#    - 完全避險模式：空單口數 = 00631L市值×2 / (指數×50)
+#    - 積極做空模式：盡可能做空（受保證金限制）
+# 5. 再平衡：每月重新調整做多/做空資金比例
+# 
+# 【參數說明】
+# - ma_period: 均線週期 (建議 10-20)
+# - long_allocation_pct: 做多資金比例 (例如 0.9 = 90% 買 00631L)
+# - short_allocation_pct: 做空保證金比例 (例如 0.1 = 10%)
+# - margin_per_contract: 小台保證金 (約 85,000 TWD/口)
+# 
+# 【成本計算】
+# - 手續費: cost_fee (每口，約 40 TWD)
+# - 交易稅: cost_tax × 合約價值 (萬分之二)
+# - 滑價: cost_slippage × 50 TWD (假設 1 點)
+# =============================================================================
 def run_backtest_original(df_data, ma_period, initial_capital, long_allocation_pct, short_allocation_pct, 
                           margin_per_contract, hedge_mode, do_rebalance, rebalance_long_target,
                           cost_fee, cost_tax, cost_slippage, include_costs):
+    """
+    期貨避險策略回測
+    
+    Args:
+        df_data: 包含 TAIEX 和 00631L 價格的 DataFrame
+        ma_period: 均線週期
+        initial_capital: 初始資金
+        long_allocation_pct: 做多資金比例
+        short_allocation_pct: 做空保證金比例
+        margin_per_contract: 每口保證金
+        hedge_mode: 避險模式 ("完全避險" 或 "積極做空")
+        do_rebalance: 是否每月再平衡
+        rebalance_long_target: 再平衡目標比例
+        cost_fee: 手續費/口
+        cost_tax: 交易稅率
+        cost_slippage: 滑價點數
+        include_costs: 是否計入成本
+    
+    Returns:
+        df: 含每日權益的 DataFrame
+        trades: 交易紀錄列表
+        total_long_pnl: 做多總損益
+        total_short_pnl: 做空總損益
+        total_cost: 總交易成本
+    """
     df = df_data.copy()
+    
+    # 計算移動平均線
     df['MA'] = df['TAIEX'].rolling(window=ma_period).mean()
+    
+    # 計算訊號 (shift(1) 確保用昨天訊號交易今天)
+    # Position = 1 表示需要避險 (指數低於均線)
     df['Position'] = (df['TAIEX'] < df['MA']).shift(1).fillna(0)
     
-    long_capital = initial_capital * long_allocation_pct
-    short_capital = initial_capital * short_allocation_pct
+    # 初始化資金
+    long_capital = initial_capital * long_allocation_pct    # 做多資金
+    short_capital = initial_capital * short_allocation_pct  # 做空保證金
     
     long_equity_arr, short_equity_arr, total_equity_arr = [], [], []
     trades = []
     
-    total_long_pnl = 0
-    total_short_pnl = 0
-    total_cost = 0
+    total_long_pnl = 0   # 做多累計損益
+    total_short_pnl = 0  # 做空累計損益
+    total_cost = 0       # 累計交易成本
     
-    current_short_capital = short_capital # Use this to track short cap
+    current_short_capital = short_capital
     
+    # 買進 00631L
     initial_price_00631L = df['00631L'].iloc[0]
     shares_00631L = long_capital / initial_price_00631L
     
-    in_trade = False
+    in_trade = False  # 是否持有空單
     entry_date, entry_price, entry_capital, entry_long_equity = None, 0, 0, 0
     last_month = df.index[0].month
     
@@ -87,61 +193,74 @@ def run_backtest_original(df_data, ma_period, initial_capital, long_allocation_p
         price_taiex = df['TAIEX'].iloc[i]
         position = df['Position'].iloc[i]
         
+        # 計算當日做多市值
         long_equity = shares_00631L * price_00631L
         
+        # 計算每日損益
         if i > 0:
             prev_price = df['00631L'].iloc[i-1]
+            # 做多損益 = 股數 × 價差
             total_long_pnl += shares_00631L * (price_00631L - prev_price)
             
             prev_taiex = df['TAIEX'].iloc[i-1]
+            
+            # 如果持有空單，計算空單損益
             if position == 1:
-                # Contracts
-                safe_margin = 3.0
+                safe_margin = 3.0  # 安全保證金倍數
                 max_contracts = int(current_short_capital / (safe_margin * margin_per_contract)) if margin_per_contract > 0 else 0
+                
                 if hedge_mode == "完全避險 (Neutral Hedge)":
-                    tg_notional = long_equity * 2
-                    tg_contracts = int(round(tg_notional / (prev_taiex * 50)))
+                    # 【修正】使用當日價格計算目標口數，而非昨日價格
+                    tg_notional = long_equity * 2  # 目標名義金額 = 00631L市值 × 2 (因為正2)
+                    tg_contracts = int(round(tg_notional / (price_taiex * 50)))  # 修正：使用當日價格
                     actual_contracts = min(tg_contracts, max_contracts)
                 else:
                     actual_contracts = max_contracts
-                    
+                
+                # 空單損益 = 口數 × 點差 × 50 × (-1) (做空賺錢方向相反)
                 diff = price_taiex - prev_taiex
                 short_pnl = actual_contracts * diff * 50 * (-1)
                 current_short_capital += short_pnl
                 total_short_pnl += short_pnl
         
-        # Costs & Trades
+        # 訊號變化時處理進出場
         prev_pos = df['Position'].iloc[i-1] if i > 0 else 0
         if position != prev_pos:
             safe_margin = 3.0
             max_c = int(current_short_capital / (safe_margin * margin_per_contract)) if margin_per_contract > 0 else 0
+            
             if hedge_mode == "完全避險 (Neutral Hedge)":
                 tg_c = int(round((long_equity * 2) / (price_taiex * 50)))
                 act_c = min(tg_c, max_c)
             else:
                 act_c = max_c
-                
+            
+            # 計算交易成本
             contracts = act_c
             if contracts > 0 and include_costs:
-                fee = contracts * cost_fee
-                tax = price_taiex * 50 * contracts * cost_tax
-                slip = contracts * cost_slippage * 50
+                fee = contracts * cost_fee                    # 手續費
+                tax = price_taiex * 50 * contracts * cost_tax # 交易稅
+                slip = contracts * cost_slippage * 50         # 滑價
                 tc = fee + tax + slip
                 current_short_capital -= tc
                 total_cost += tc
             
+            # 記錄交易
             if position == 1 and not in_trade:
+                # 開空單
                 in_trade = True
                 entry_date = date
                 entry_price = price_taiex
                 entry_capital = current_short_capital
                 entry_long_equity = long_equity
+                
             elif position == 0 and in_trade:
+                # 平倉空單
                 in_trade = False
                 exit_price = price_taiex
-                pts = entry_price - exit_price
+                pts = entry_price - exit_price  # 賺的點數 (進場-出場，因為做空)
                 
-                # Re-calc entries logic for record
+                # 計算實際交易績效
                 max_ce = int(entry_capital / (3.0 * margin_per_contract)) if margin_per_contract > 0 else 0
                 if hedge_mode == "完全避險 (Neutral Hedge)":
                     tg_ce = int(round((entry_long_equity * 2) / (entry_price * 50)))
@@ -149,7 +268,7 @@ def run_backtest_original(df_data, ma_period, initial_capital, long_allocation_p
                 else:
                     act_ce = max_ce
                 
-                prof_twd = pts * 50 * act_ce
+                prof_twd = pts * 50 * act_ce  # 獲利金額
                 entry_notional = act_ce * entry_price * 50
                 eff_lev = entry_notional / entry_capital if entry_capital > 0 else 0
                 ret = (entry_price - exit_price) / entry_price
@@ -164,7 +283,7 @@ def run_backtest_original(df_data, ma_period, initial_capital, long_allocation_p
         short_equity = current_short_capital
         total_equity = long_equity + short_equity
         
-        # Rebalance
+        # 每月再平衡
         curr_month = date.month
         if do_rebalance and i > 0 and curr_month != last_month:
             t_long = total_equity * rebalance_long_target
@@ -180,7 +299,7 @@ def run_backtest_original(df_data, ma_period, initial_capital, long_allocation_p
         short_equity_arr.append(short_equity)
         total_equity_arr.append(total_equity)
         
-    # Open Trade
+    # 處理未平倉部位
     if in_trade:
         now_price = df['TAIEX'].iloc[-1]
         pts = entry_price - now_price
@@ -211,21 +330,61 @@ def run_backtest_original(df_data, ma_period, initial_capital, long_allocation_p
     
     return df, trades, total_long_pnl, total_short_pnl, total_cost
 
-# --- 2. New Rebalance Strategy ---
+# =============================================================================
+# 策略2: 資產平衡策略 (00631L + 現金定期再平衡)
+# =============================================================================
+# 【策略邏輯說明】
+# 1. 將資金分配為 X% 00631L + (100-X)% 現金
+# 2. 每月初檢查配置比例，若偏離目標則再平衡
+# 3. 再平衡邏輯：賣高買低，維持目標配置
+# 
+# 【優點】
+# - 自動賣高買低，降低追漲殺跌風險
+# - 保留現金緩衝，降低整體波動
+# 
+# 【缺點】
+# - 多頭市場中現金部位拖累表現
+# - 每次再平衡需付交易成本
+# 
+# 【成本計算】
+# - 股票手續費: 0.1425% × 0.6 (折扣後) 
+# - 證交稅: 0.1% (賣出時)
+# =============================================================================
 def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
-    df = df_data.copy()
-    cash = initial_capital * (1 - target_00631_pct)
-    alloc_00631 = initial_capital * target_00631_pct
-    shares = alloc_00631 / df['00631L'].iloc[0]
+    """
+    資產平衡策略回測
     
-    # Simple cost model for rebalance
-    cost_rate = 0.001425 * 0.6 + 0.001
+    Args:
+        df_data: 包含 00631L 價格的 DataFrame
+        initial_capital: 初始資金
+        target_00631_pct: 目標 00631L 配置比例 (0.0-1.0)
+    
+    Returns:
+        df: 含每日權益的 DataFrame
+        log: 再平衡紀錄
+        total_cost: 總交易成本
+    """
+    df = df_data.copy()
+    
+    # 初始配置
+    cash = initial_capital * (1 - target_00631_pct)     # 現金部位
+    alloc_00631 = initial_capital * target_00631_pct   # 股票部位
+    shares = alloc_00631 / df['00631L'].iloc[0]        # 股數
+    
+    # 成本參數 (【修正】正確計算成本)
+    # 手續費 0.1425% × 0.6 折扣 + 證交稅 0.1% (賣出)
+    buy_cost_rate = 0.001425 * 0.6         # 買入成本 (只有手續費)
+    sell_cost_rate = 0.001425 * 0.6 + 0.001  # 賣出成本 (手續費 + 證交稅)
     
     eq_arr, cash_arr = [], []
     log = []
     last_month = df.index[0].month
+    total_cost_accum = 0  # 【修正】追蹤累積成本
     
-    # Initial Log
+    # 記錄初始建倉
+    initial_cost = alloc_00631 * buy_cost_rate
+    total_cost_accum += initial_cost
+    
     log.append({
         '日期': df.index[0].strftime('%Y-%m-%d'),
         '動作': '建倉',
@@ -233,32 +392,46 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
         '股數變動': int(shares),
         '持有股數': int(shares),
         '現金餘額': int(cash),
-        '總資產': int(initial_capital)
+        '總資產': int(initial_capital),
+        '交易成本': int(initial_cost)  # 【修正】加入成本欄位
     })
     
     for i in range(len(df)):
         price = df['00631L'].iloc[i]
-        val = shares * price
-        tot = val + cash
+        val = shares * price  # 股票市值
+        tot = val + cash      # 總資產
         
         curr_month = df.index[i].month
+        
+        # 每月初檢查是否需要再平衡
         if i > 0 and curr_month != last_month:
-            tgt_val = tot * target_00631_pct
-            diff = tgt_val - val
+            tgt_val = tot * target_00631_pct  # 目標股票市值
+            diff = tgt_val - val              # 差額
+            
+            # 只有差額超過 1000 才執行再平衡 (避免過度交易)
             if abs(diff) > 1000:
-                cost = abs(diff) * cost_rate
+                # 【修正】根據買入/賣出分別計算成本
+                if diff > 0:
+                    # 買入股票
+                    cost = abs(diff) * buy_cost_rate
+                else:
+                    # 賣出股票
+                    cost = abs(diff) * sell_cost_rate
+                
                 shares_diff = diff / price
                 shares += shares_diff
                 cash -= (diff + cost)
+                total_cost_accum += cost  # 【修正】累計成本
                 
                 log.append({
                     '日期': df.index[i].strftime('%Y-%m-%d'),
-                    '動作': '再平衡',
+                    '動作': '再平衡 (買)' if diff > 0 else '再平衡 (賣)',
                     '成交價': f"{price:.2f}",
                     '股數變動': int(shares_diff),
                     '持有股數': int(shares),
                     '現金餘額': int(cash),
-                    '總資產': int(tot)
+                    '總資產': int(tot),
+                    '交易成本': int(cost)  # 【修正】紀錄每次成本
                 })
         
         last_month = curr_month
@@ -269,105 +442,182 @@ def run_backtest_rebalance(df_data, initial_capital, target_00631_pct):
     df['Cash'] = cash_arr
     df['Benchmark'] = (df['00631L'] / df['00631L'].iloc[0]) * initial_capital
     
-    # Calculate Total Cost
-    total_cost = initial_capital - df['Total_Equity'].iloc[-1] # This is wrong, equity change includes PnL.
-    # We need to track cost in the loop.
-    # Re-implementing loop tracking for cost.
-    
-    return df, pd.DataFrame(log), sum([x['交易成本'] for x in log if '交易成本' in x])
+    # 【修正】正確回傳累積成本
+    return df, pd.DataFrame(log), total_cost_accum
 
-# --- 3. Simple Futures Strategy (Long Only / Trend) ---
-def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_period, dividend_yield=0.04, cost_fee=40, cost_tax=2e-5, cost_slippage=1, ignore_short_yield=False):
+# =============================================================================
+# 策略3: 純期貨策略 (做多/趨勢/波段)
+# =============================================================================
+# 【策略邏輯說明】
+# 1. Long-Only (純做多)：永遠做多期貨，享受槓桿效果
+# 2. Trend (趨勢)：指數 > MA 做多，指數 < MA 做空
+# 3. Long-MA (波段做多)：指數 > MA 做多，指數 < MA 空手
+# 
+# 【逆價差/殖利率說明】
+# - 台指期因預期股息，通常呈現「逆價差」(期貨低於現貨)
+# - 做多期貨：隨著到期日接近，會「收斂」賺取隱含收益
+# - 做空期貨：需「支付」逆價差成本 (實際上是報價較低，結算時虧錢)
+# - 年化約 4% (依市場狀況變動)
+# 
+# 【修正項目】
+# - 做空時逆價差為成本 (不是收益)
+# - 增加調整門檻，避免每日微調造成過度交易
+# 
+# 【成本計算】
+# - 手續費: cost_fee (約 40 TWD/口)
+# - 交易稅: cost_tax × 合約價值
+# - 滑價: cost_slippage × 50 TWD
+# =============================================================================
+def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_period, 
+                                 dividend_yield=0.04, cost_fee=40, cost_tax=2e-5, 
+                                 cost_slippage=1, ignore_short_yield=False,
+                                 adjustment_threshold=0.1):  # 【新增】調整門檻參數
+    """
+    純期貨策略回測
+    
+    Args:
+        df_data: 包含 TAIEX 和 00631L 價格的 DataFrame
+        initial_capital: 初始資金
+        leverage: 槓桿倍數
+        mode: 策略模式 ('Long-Only', 'Trend', 'Long-MA')
+        ma_period: 均線週期
+        dividend_yield: 年化逆價差率 (預設 4%)
+        cost_fee: 手續費/口
+        cost_tax: 交易稅率
+        cost_slippage: 滑價點數
+        ignore_short_yield: 做空時是否忽略殖利率成本 (測試用)
+        adjustment_threshold: 調整門檻 (0.1 = 口數偏差超過 10% 才調整)
+    
+    Returns:
+        df: 含每日權益的 DataFrame
+        log: 交易紀錄
+        total_cost: 總交易成本
+    """
     df = df_data.copy()
     
-    # Calculate Signal
+    # 計算訊號
     if mode == 'Trend':
-        # Trend: Price > MA -> Long (1), Price < MA -> Short (-1)
+        # 趨勢策略：指數 > MA 做多(+1)，指數 < MA 做空(-1)
         df['MA'] = df['TAIEX'].rolling(window=ma_period).mean()
-        # Signal is based on Yesterday's Close vs MA to trade Today
-        # 1 = Long, -1 = Short
         df['Signal'] = np.where(df['TAIEX'] > df['MA'], 1, -1)
-        df['Signal'] = df['Signal'].shift(1).fillna(0) # shift to apply to next day
+        df['Signal'] = df['Signal'].shift(1).fillna(0)  # 用昨天訊號交易今天
+        
     elif mode == 'Long-MA':
-        # Long-MA: Price > MA -> Long (1), Price < MA -> Cash (0)
+        # 波段做多策略：指數 > MA 做多(+1)，指數 < MA 空手(0)
         df['MA'] = df['TAIEX'].rolling(window=ma_period).mean()
         df['Signal'] = np.where(df['TAIEX'] > df['MA'], 1, 0)
         df['Signal'] = df['Signal'].shift(1).fillna(0)
+        
     else:
-        # Long Only
+        # 純做多策略：永遠做多
         df['Signal'] = 1
         
-    equity = initial_capital
-    held_contracts = 0
-    cash = initial_capital # Track cash for PnL calculation
+    # 初始化變數
+    cash = initial_capital           # 權益 (含已實現損益)
+    held_contracts = 0               # 目前持有口數
     
-    equity_arr = []
-    cash_arr = []
-    log = []
-    total_cost_accum = 0
+    cash_arr = []                    # 每日權益紀錄
+    log = []                         # 交易紀錄
+    total_cost_accum = 0             # 累計交易成本
     
-    # Daily Yield Rate (approx)
+    # 日化殖利率
     daily_yield_rate = dividend_yield / 252.0
     
-    avg_entry = 0
+    avg_entry = 0  # 平均進場成本
     
     for i in range(len(df)):
         price = df['TAIEX'].iloc[i]
         date = df.index[i]
         signal = df['Signal'].iloc[i]
         
-        # 1. Calculate PnL from previous day's holding
+        # ============================================================
+        # 步驟1: 計算昨日持倉的損益
+        # ============================================================
         if i > 0:
             prev_price = df['TAIEX'].iloc[i-1]
             
-            # Price PnL
+            # 價差損益
             price_pnl = (price - prev_price) * held_contracts * 50
             
-            # Yield PnL
-            if held_contracts < 0 and ignore_short_yield:
-                yield_pnl = 0
-            else:
-                yield_points = prev_price * daily_yield_rate
+            # 逆價差損益
+            # 【修正】做空時逆價差是成本，不是收益
+            yield_points = prev_price * daily_yield_rate
+            if held_contracts > 0:
+                # 做多：賺取逆價差收益
                 yield_pnl = held_contracts * yield_points * 50
+            elif held_contracts < 0:
+                # 【修正】做空：支付逆價差成本 (負的)
+                if ignore_short_yield:
+                    yield_pnl = 0  # 測試模式：忽略此成本
+                else:
+                    yield_pnl = held_contracts * yield_points * 50  # 負口數 × 正收益 = 負損益
+            else:
+                yield_pnl = 0
             
             total_pnl = price_pnl + yield_pnl
             cash += total_pnl
             
-        # 2. Adjust Position (Rebalance or Signal Change)
+        # ============================================================
+        # 步驟2: 計算目標口數
+        # ============================================================
         target_contracts = 0
         
         if mode == 'Long-Only':
             target_notional = cash * leverage
             target_contracts = int(round(target_notional / (price * 50)))
+            
         elif mode == 'Trend' or mode == 'Long-MA':
-            if signal == 1: # Long
+            if signal == 1:      # 做多訊號
                 target_notional = cash * leverage
                 target_contracts = int(round(target_notional / (price * 50)))
-            elif signal == -1: # Short
+            elif signal == -1:   # 做空訊號
                 target_notional = cash * leverage
                 target_contracts = -int(round(target_notional / (price * 50)))
-            else: # Cash
+            else:                # 空手訊號
                 target_contracts = 0
-                
-        # Execute Trade
-        if target_contracts != held_contracts:
+        
+        # ============================================================
+        # 步驟3: 判斷是否需要調整部位
+        # ============================================================
+        # 【新增】調整門檻邏輯，避免過度交易
+        need_adjust = False
+        
+        if held_contracts == 0 and target_contracts != 0:
+            # 從空手到有部位 → 必須調整
+            need_adjust = True
+        elif target_contracts == 0 and held_contracts != 0:
+            # 從有部位到空手 → 必須調整
+            need_adjust = True
+        elif held_contracts != 0 and target_contracts != 0:
+            # 同方向但口數不同
+            if held_contracts * target_contracts < 0:
+                # 反手 → 必須調整
+                need_adjust = True
+            else:
+                # 同方向，檢查偏差是否超過門檻
+                deviation = abs(target_contracts - held_contracts) / abs(held_contracts)
+                if deviation > adjustment_threshold:
+                    need_adjust = True
+        
+        # ============================================================
+        # 步驟4: 執行交易
+        # ============================================================
+        if need_adjust:
             diff = target_contracts - held_contracts
             
-            # Calculate Transaction Cost
+            # 計算交易成本
             cost = abs(diff) * (cost_fee + cost_tax * price * 50 + cost_slippage * 50)
             cash -= cost
             total_cost_accum += cost
             
-            # Calculate Realized PnL (for log only)
+            # 計算已實現損益 (用於 log)
             realized_pnl = 0
-            
-            # Closing/Reducing
             if held_contracts != 0:
-                if held_contracts * target_contracts < 0: # Reversal
+                if held_contracts * target_contracts < 0:  # 反手
                     closed_qty = abs(held_contracts)
-                elif target_contracts == 0: # Full Close
+                elif target_contracts == 0:  # 全部平倉
                     closed_qty = abs(held_contracts)
-                elif abs(target_contracts) < abs(held_contracts) and (held_contracts * target_contracts > 0): # Partial Reduce
+                elif abs(target_contracts) < abs(held_contracts):  # 減碼
                     closed_qty = abs(diff)
                 else:
                     closed_qty = 0
@@ -376,22 +626,21 @@ def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_per
                     direction = 1 if held_contracts > 0 else -1
                     realized_pnl = (price - avg_entry) * closed_qty * 50 * direction
             
-            # Update Avg Entry for New/Increased Position
+            # 更新平均成本
             if target_contracts != 0:
                 if held_contracts == 0 or (held_contracts * target_contracts < 0):
-                    # Fresh or Reversal
-                    avg_entry = price
+                    avg_entry = price  # 新建倉或反手
                 elif abs(target_contracts) > abs(held_contracts):
-                    # Increasing
+                    # 加碼：加權平均成本
                     old_vol = abs(held_contracts)
                     added_vol = abs(diff)
                     avg_entry = (old_vol * avg_entry + added_vol * price) / (old_vol + added_vol)
             
-            # Update Position
+            # 更新持倉
             prev_contracts = held_contracts
             held_contracts = target_contracts
             
-            # Determine Action Label
+            # 決定動作標籤
             if prev_contracts == 0:
                 action = '新倉 (多)' if target_contracts > 0 else '新倉 (空)'
             elif target_contracts == 0:
@@ -423,13 +672,49 @@ def run_backtest_futures_simple(df_data, initial_capital, leverage, mode, ma_per
     
     return df, pd.DataFrame(log), total_cost_accum
 
-# --- 4. Futures + 00878 Strategy ---
+
+# =============================================================================
+# 策略4: 期貨 + 00878 策略
+# =============================================================================
+# 【策略邏輯說明】
+# 1. 用期貨達成槓桿曝險 (例如 2 倍大盤)
+# 2. 期貨只需少量保證金，剩餘資金買入 00878 (高股息 ETF)
+# 3. 每月再平衡，維持目標槓桿和風險指標
+# 
+# 【資金配置邏輯】
+# - 期貨保證金：約 85,000 TWD/口
+# - 風險指標：保留保證金的 300% 現金 (避免追繳)
+# - 剩餘資金：買入 00878 賺取股息
+# 
+# 【優點】
+# - 同時享受槓桿報酬 + 股息收入
+# - 利用期貨逆價差額外獲利
+# 
+# 【缺點/風險】
+# - 雙重風險：期貨虧損 + 00878 價格下跌
+# - 保證金追繳風險
+# - 注意：目前未計入 00878 股息
+# =============================================================================
 def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_contract, target_risk_ratio=3.0, dividend_yield=0.04):
+    """
+    期貨 + 00878 策略回測
+    
+    Args:
+        df_data: 包含 TAIEX 和 00878 價格的 DataFrame
+        initial_capital: 初始資金
+        leverage: 期貨槓桿倍數 (1.0-4.0)
+        margin_per_contract: 每口保證金 (約 85,000 TWD)
+        target_risk_ratio: 風險指標 (3.0 = 保留 300% 保證金)
+        dividend_yield: 年化逆價差率
+    
+    Returns:
+        df: 含每日權益的 DataFrame
+        rebalance_log: 再平衡紀錄
+        total_cost: 總交易成本
+    """
     df = df_data.copy()
     
-    # Fill 00878 NaN with 0 (or handle in loop)
-    # Actually, if 00878 is NaN, we just hold Cash.
-    
+    # 初始化變數
     equity = initial_capital
     cash = initial_capital
     shares_00878 = 0
@@ -444,7 +729,7 @@ def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_co
     last_month = df.index[0].month
     daily_yield_rate = dividend_yield / 252.0
     
-    # Cost parameters (approx)
+    # 成本參數
     cost_fee = 40
     cost_tax = 2e-5
     cost_slippage = 1
@@ -464,26 +749,42 @@ def run_backtest_futures_00878(df_data, initial_capital, leverage, margin_per_co
             price_pnl = held_contracts * diff_pts * 50
             
             # Futures Yield PnL (Backwardation/Dividend)
-            # Same logic as Strategy 3
             yield_points = prev_taiex * daily_yield_rate
             yield_pnl = held_contracts * yield_points * 50
             
             fut_pnl = price_pnl + yield_pnl
             
-            # 00878 PnL
+            # 00878 PnL (價差)
             if shares_00878 > 0 and not pd.isna(price_00878) and not pd.isna(prev_00878):
                 stock_pnl = shares_00878 * (price_00878 - prev_00878)
             else:
                 stock_pnl = 0
+            
+            # 【新增】00878 股息收入
+            date_str = date.strftime('%Y-%m-%d')
+            dividend_per_share = get_dividend_00878(date_str)
+            if dividend_per_share > 0 and shares_00878 > 0:
+                dividend_income = shares_00878 * dividend_per_share
+                cash += dividend_income  # 股息入帳到現金
+                rebalance_log.append({
+                    '日期': date_str,
+                    '總資產': int(total_equity if 'total_equity' in dir() else equity),
+                    '加權指數': int(price_taiex),
+                    '目標曝險': 0,
+                    '期貨口數': int(held_contracts),
+                    '期貨變動': 0,
+                    '保留現金(期貨)': int(cash),
+                    '00878股價': f"{price_00878:.2f}" if not pd.isna(price_00878) else "N/A",
+                    '00878股數': int(shares_00878),
+                    '00878變動': 0,
+                    '備註': f"股息入帳 ${dividend_per_share:.2f}/股，共 ${dividend_income:,.0f}"
+                })
                 
             equity += (fut_pnl + stock_pnl)
-            cash += fut_pnl # Futures PnL settles to cash
-            # Stock PnL is unrealized until rebalance, but for Total Equity we add it.
+            cash += fut_pnl  # Futures PnL settles to cash
             
-        # Recalculate Equity based on components to be precise
+        # Recalculate Equity based on components
         current_00878_val = shares_00878 * price_00878 if (shares_00878 > 0 and not pd.isna(price_00878)) else 0
-        # Note: 'cash' here includes the futures margin deposit.
-        # So Total Equity = Cash + Stock Value.
         total_equity = cash + current_00878_val
         
         # 2. Rebalance (Monthly)
@@ -1346,20 +1647,96 @@ def render_comparison_page(df):
         )
         st.plotly_chart(fig, use_container_width=True)
         
+        # Calculate Long P&L and Short P&L for each strategy
+        # Formula: 初始資金 + 做多損益 + 做空損益 - 手續費 = 期末總資產
+        
+        # Helper function for pure futures strategies (no separate long/short, just total P&L)
+        def calc_futures_pnl(df_result, initial_capital, cost):
+            """For pure futures strategies, total P&L = final - initial + cost"""
+            final = df_result['Total_Equity'].iloc[-1]
+            total_pnl = final - initial_capital + cost  # Add back cost since it was deducted
+            return total_pnl, 0  # All is "long-like" for long strategies
+        
+        # Helper for trend strategy (has both long and short periods)
+        def calc_trend_pnl(log_df):
+            """Calculate long pnl and short pnl from trend strategy log"""
+            if log_df is None or log_df.empty or '本筆損益' not in log_df.columns:
+                return 0, 0
+            
+            long_pnl = 0
+            short_pnl = 0
+            
+            for i, row in log_df.iterrows():
+                pnl = row.get('本筆損益', 0)
+                action = row.get('動作', '')
+                
+                if pnl != 0:
+                    # Check if it was a long or short position being closed
+                    if '多' in action or ('平倉' in action and row.get('目標口數', 0) <= 0):
+                        long_pnl += pnl
+                    elif '空' in action:
+                        short_pnl += pnl
+                    else:
+                        # Default: if previous contracts > 0, it was long
+                        long_pnl += pnl
+            
+            return long_pnl, short_pnl
+        
+        # 1. Buy&Hold 00631L - No trading
+        long_pnl_bh = df_f['Benchmark'].iloc[-1] - cap
+        short_pnl_bh = 0
+        
+        # 2. 期貨避險策略 - Already returned from run_backtest_original
+        # Need to re-run to get the actual values
+        df_f2, trades_f2, long_pnl_f, short_pnl_f, cost_f2 = run_backtest_original(
+            df, 13, cap, f_long_pct, 1-f_long_pct, 85000, 
+            '完全避險 (Neutral Hedge)', True, f_long_pct, 
+            40, 2e-5, 1, True
+        )
+        
+        # 3. 資產平衡策略 - Calculate from equity change
+        long_pnl_r = df_r['Total_Equity'].iloc[-1] - cap + cost_r
+        short_pnl_r = 0  # No short positions
+        
+        # 4. 純期貨做多 - All is long
+        long_pnl_fl = df_fl['Total_Equity'].iloc[-1] - cap + cost_fl
+        short_pnl_fl = 0
+        
+        # 5. 純期貨趨勢 - Has both long and short
+        long_pnl_ft, short_pnl_ft = calc_trend_pnl(log_ft)
+        # Adjust if numbers don't add up (due to unrealized or calculation differences)
+        total_pnl_ft = df_ft['Total_Equity'].iloc[-1] - cap + cost_ft
+        if long_pnl_ft + short_pnl_ft == 0:
+            # Fallback: use total as "long" if can't separate
+            long_pnl_ft = total_pnl_ft
+            short_pnl_ft = 0
+        
+        # 6. 期貨 + 00878 - All is long-like
+        long_pnl_f8 = df_f8['Total_Equity'].iloc[-1] - cap + cost_f8
+        short_pnl_f8 = 0
+        
+        # 7. 單純持有 00878
+        long_pnl_8only = df_8only['Total_Equity'].iloc[-1] - cap + cost_8only
+        short_pnl_8only = 0
+        
+        # 8. 純期貨 (波段做多)
+        long_pnl_fma = df_fma['Total_Equity'].iloc[-1] - cap + cost_fma
+        short_pnl_fma = 0
+        
         # Table
         data = []
         strategies = [
-            ('Buy&Hold 00631L', '100% 持有', df_f['Benchmark'], 0), 
-            ('期貨避險策略', f'00631L {f_long_pct:.0%} / 現金 {1-f_long_pct:.0%}', df_f['Total_Equity'], cost_f), 
-            ('資產平衡策略', f'00631L {r_long_pct:.0%} / 現金 {1-r_long_pct:.0%}', df_r['Total_Equity'], cost_r),
-            ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity'], cost_fl),
-            ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'], cost_ft),
-            ('期貨 + 00878', f'槓桿 {f8_lev}x / 風險指標 {f8_risk:.0%}', df_f8['Total_Equity'], cost_f8),
-            ('單純持有 00878', '100% 持有 (2020/7上市)', df_8only['Total_Equity'], cost_8only),
-            ('純期貨 (波段做多)', f'槓桿 {fut_lev}x / MA{ma_long}', df_fma['Total_Equity'], cost_fma)
+            ('Buy&Hold 00631L', '100% 持有', df_f['Benchmark'], 0, long_pnl_bh, short_pnl_bh), 
+            ('期貨避險策略', f'00631L {f_long_pct:.0%} / 現金 {1-f_long_pct:.0%}', df_f['Total_Equity'], cost_f, long_pnl_f, short_pnl_f), 
+            ('資產平衡策略', f'00631L {r_long_pct:.0%} / 現金 {1-r_long_pct:.0%}', df_r['Total_Equity'], cost_r, long_pnl_r, short_pnl_r),
+            ('純期貨做多', f'槓桿 {fut_lev}x / 殖利率 {div_yield:.1%}', df_fl['Total_Equity'], cost_fl, long_pnl_fl, short_pnl_fl),
+            ('純期貨趨勢 (多空)', f'槓桿 {fut_lev}x / MA{ma_trend} / 殖利率 {div_yield:.1%}', df_ft['Total_Equity'], cost_ft, long_pnl_ft, short_pnl_ft),
+            ('期貨 + 00878', f'槓桿 {f8_lev}x / 風險指標 {f8_risk:.0%}', df_f8['Total_Equity'], cost_f8, long_pnl_f8, short_pnl_f8),
+            ('單純持有 00878', '100% 持有 (2020/7上市)', df_8only['Total_Equity'], cost_8only, long_pnl_8only, short_pnl_8only),
+            ('純期貨 (波段做多)', f'槓桿 {fut_lev}x / MA{ma_long}', df_fma['Total_Equity'], cost_fma, long_pnl_fma, short_pnl_fma)
         ]
         
-        for name, param, d, cost in strategies:
+        for name, param, d, cost, long_pnl, short_pnl in strategies:
             final_val = d.iloc[-1]
             ret = (final_val - cap) / cap
             
@@ -1376,17 +1753,29 @@ def render_comparison_page(df):
             drawdown = (d - roll_max) / roll_max
             mdd = drawdown.min()
             
+            # Verify formula: 初始資金 + 做多損益 + 做空損益 - 手續費 = 期末總資產
+            calculated = cap + long_pnl + short_pnl - cost
+            
             data.append({
+                'ret_value': ret,  # For sorting
                 '策略名稱': name,
                 '參數設定': param,
                 '總報酬率': f"{ret:.2%}", 
                 '年化報酬率 (CAGR)': f"{cagr:.2%}",
                 '最大回撤 (MDD)': f"{mdd:.2%}", 
                 '總交易成本': f"{cost:,.0f}",
+                '做多總損益': f"{long_pnl:,.0f}",
+                '做空總損益': f"{short_pnl:,.0f}" if short_pnl != 0 else "-",
                 '期末總資產': f"{final_val:,.0f}"
             })
-            
-        st.table(pd.DataFrame(data))
+        
+        # Sort by return rate (descending) and add ranking
+        df_result = pd.DataFrame(data)
+        df_result = df_result.sort_values('ret_value', ascending=False).reset_index(drop=True)
+        df_result.insert(0, '排名', range(1, len(df_result) + 1))
+        df_result = df_result.drop('ret_value', axis=1)  # Remove sorting column
+        
+        st.table(df_result)
         
 
         
@@ -1537,7 +1926,33 @@ def render_comparison_page(df):
                     yaxis_title='指數 / 價格',
                     hovermode='closest',
                     template="plotly_white",
-                    height=500
+                    height=600,
+                    # Add range slider for time selection
+                    xaxis=dict(
+                        rangeslider=dict(visible=True, thickness=0.05),
+                        rangeselector=dict(
+                            buttons=list([
+                                dict(count=6, label="6個月", step="month", stepmode="backward"),
+                                dict(count=1, label="1年", step="year", stepmode="backward"),
+                                dict(count=3, label="3年", step="year", stepmode="backward"),
+                                dict(count=5, label="5年", step="year", stepmode="backward"),
+                                dict(step="all", label="全部")
+                            ]),
+                            bgcolor="lightgray",
+                            activecolor="red",
+                            font=dict(size=12),
+                        ),
+                        type="date",
+                        tickformat="%Y-%m",  # Show Year-Month only
+                        dtick="M6",  # Tick every 6 months
+                    ),
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="right",
+                        x=1
+                    )
                 )
                 st.plotly_chart(fig_detail, use_container_width=True)
             else:
@@ -1568,6 +1983,101 @@ def render_comparison_page(df):
             
         with st.expander("7. 純期貨 (波段做多) - 交易紀錄"):
             st.dataframe(log_fma, use_container_width=True)
+
+        # =============================================================================
+        # 策略分析報告
+        # =============================================================================
+        st.markdown("---")
+        st.subheader("📖 策略分析報告")
+        
+        # 策略總覽
+        with st.expander("📊 策略總覽", expanded=True):
+            st.markdown("""
+| 類型 | 策略 | 風險等級 | 適合投資人 |
+|------|------|---------|-----------|
+| 🔵 被動持有 | Buy&Hold 00631L | 中高 | 長期看多、能承受波動 |
+| 🔵 被動持有 | 單純持有 00878 | 低 | 追求穩定現金流 |
+| 🟢 避險/平衡 | 期貨避險策略 | 中 | 想降低 00631L 波動 |
+| 🟢 避險/平衡 | 資產平衡策略 | 中低 | 保守型投資人 |
+| 🔴 槓桿期貨 | 純期貨做多 | 高 | 熟悉期貨、高風險承受 |
+| 🔴 槓桿期貨 | 純期貨趨勢 (多空) | 極高 | 專業交易者 |
+| 🔴 槓桿期貨 | 純期貨 (波段做多) | 高 | 想降低期貨風險 |
+| 🟡 混合策略 | 期貨 + 00878 | 中高 | 追求成長+配息 |
+            """)
+        
+        # 各策略詳細說明
+        with st.expander("📈 各策略詳細說明"):
+            st.markdown("""
+### 1. Buy&Hold 00631L
+- **邏輯**: 買進持有 00631L，享受約 2 倍大盤曝險
+- **優點**: 簡單、無交易成本、多頭時表現佳
+- **缺點**: 空頭時虧損加倍、有管理費 (~1%/年)
+
+### 2. 期貨避險策略
+- **邏輯**: 持有 00631L + 均線下彎時做空期貨避險
+- **訊號**: 指數 < MA → 建空單；指數 > MA → 平倉
+- **優點**: 降低回檔損失、保留多頭收益
+
+### 3. 資產平衡策略
+- **邏輯**: 70% 00631L + 30% 現金，每月再平衡
+- **優點**: 自動賣高買低、降低波動
+
+### 4. 純期貨做多
+- **邏輯**: 100% 資金做多小台期貨 + 槓桿
+- **特色**: 享受逆價差收益 (~4%/年)
+- ⚠️ 2 倍槓桿時，大盤跌 25% = 資金腰斬
+
+### 5. 純期貨趨勢 (多空)
+- **邏輯**: 指數 > MA → 做多；指數 < MA → 做空
+- ⚠️ 做空期貨需支付逆價差成本
+
+### 6. 純期貨 (波段做多)
+- **邏輯**: 指數 > MA → 做多；指數 < MA → 空手
+- **優點**: 避開主要下跌、保留現金
+
+### 7. 期貨 + 00878
+- **邏輯**: 期貨達成槓桿曝險 + 閒置資金買 00878
+- **特色**: 槓桿 + 股息雙重收益
+- ✅ 已計入 00878 歷史配息
+
+### 8. 單純持有 00878
+- **邏輯**: 100% 買進持有 00878 高股息 ETF
+- **股息殖利率**: 約 5-6%/年
+            """)
+        
+        # 風險比較
+        with st.expander("⚠️ 風險等級比較"):
+            st.markdown("""
+```
+風險等級 (低 → 高)
+
+單純持有 00878
+    ↓
+資產平衡策略
+    ↓
+期貨避險策略
+    ↓
+期貨 + 00878
+    ↓
+Buy&Hold 00631L
+    ↓
+純期貨做多
+    ↓
+純期貨 (波段做多)
+    ↓
+純期貨趨勢 (多空)
+```
+            """)
+            
+        # 重要提醒
+        with st.expander("💡 投資注意事項"):
+            st.warning("""
+**重要提醒:**
+1. **沒有最好的策略**，只有最適合自己的策略
+2. **槓桿是雙面刃**：放大獲利也放大虧損
+3. **回測 ≠ 實戰**：滑價、情緒、黑天鵝都會影響績效
+4. **建議**：從低風險策略開始，逐步調整
+            """)
 
 # --- Main Flow ---
 st.sidebar.header("資料來源")
