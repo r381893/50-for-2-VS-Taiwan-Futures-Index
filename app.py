@@ -1819,6 +1819,10 @@ def render_original_strategy_page(df):
             last_taiex = sim_df['TAIEX'].iloc[0]
             last_month = sim_df.index[0].month
             
+            # 追蹤避險進場資訊
+            hedge_entry_date = None
+            hedge_entry_price_tracked = 0
+            
             for i in range(len(sim_df)):
                 date = sim_df.index[i]
                 price_00631L = sim_df['00631L'].iloc[i]
@@ -1847,8 +1851,16 @@ def render_original_strategy_page(df):
                     else:
                         target_contracts = 0
                 
-                # 調整期貨部位
+                # 調整期貨部位 - 追蹤進場日期和價格
                 if target_contracts != sim_contracts:
+                    if target_contracts > 0 and sim_contracts == 0:
+                        # 新開倉：記錄進場日期和價格
+                        hedge_entry_date = date
+                        hedge_entry_price_tracked = int(price_taiex)
+                    elif target_contracts == 0 and sim_contracts > 0:
+                        # 平倉：清除進場記錄
+                        hedge_entry_date = None
+                        hedge_entry_price_tracked = 0
                     sim_contracts = target_contracts
                 
                 # 每月再平衡 (只調整股票和現金，不動期貨)
@@ -1869,8 +1881,11 @@ def render_original_strategy_page(df):
             short_capital = int(sim_cash)
             cost_price = start_price_00631L
             held_contracts = sim_contracts
-            hedge_entry_price = int(last_taiex) if sim_contracts > 0 else 0
+            hedge_entry_price = hedge_entry_price_tracked
             futures_total_pnl = int(sim_futures_pnl_total)
+            
+            # 進場日期轉為字串
+            hedge_entry_date_str = hedge_entry_date.strftime('%Y-%m-%d') if hedge_entry_date else None
             
             # 顯示模擬結果
             final_value = shares_00631L * current_price_00631L + short_capital
@@ -1884,6 +1899,7 @@ def render_original_strategy_page(df):
                     "short_capital": short_capital,
                     "held_contracts": held_contracts,
                     "hedge_entry_price": hedge_entry_price,
+                    "hedge_entry_date": hedge_entry_date_str,
                     "use_auto_calc": True
                 }
                 save_settings(new_settings)
@@ -1999,14 +2015,21 @@ def render_original_strategy_page(df):
                 metric_card("避險口數", contract_status, color="orange")
             with col_h3:
                 if held_contracts > 0 and hedge_entry_price > 0:
-                    metric_card("進場指數", f"{hedge_entry_price:,}", delta=f"現價: {last_close:,.0f}", color="orange")
+                    # 顯示進場日期
+                    entry_date_display = hedge_entry_date_str if 'hedge_entry_date_str' in dir() and hedge_entry_date_str else settings.get("hedge_entry_date", "")
+                    if entry_date_display:
+                        metric_card("進場指數", f"{hedge_entry_price:,}", delta=f"📅 {entry_date_display}", color="orange")
+                    else:
+                        metric_card("進場指數", f"{hedge_entry_price:,}", delta=f"現價: {last_close:,.0f}", color="orange")
                 else:
                     metric_card("進場指數", "-", color="orange")
             with col_h4:
-                if held_contracts > 0:
-                    hedge_pnl_color = "red" if hedge_unrealized_pnl > 0 else "green"
-                    hedge_emoji = "🔴" if hedge_unrealized_pnl > 0 else "🟢"
-                    metric_card("避險損益", f"{hedge_emoji} {hedge_unrealized_pnl:+,.0f}", color=hedge_pnl_color)
+                if held_contracts > 0 and hedge_entry_price > 0:
+                    # 重新計算正確的避險損益
+                    actual_hedge_pnl = (hedge_entry_price - last_close) * held_contracts * 50
+                    hedge_pnl_color = "red" if actual_hedge_pnl > 0 else "green"
+                    hedge_emoji = "🔴" if actual_hedge_pnl > 0 else "🟢"
+                    metric_card("避險損益", f"{hedge_emoji} {actual_hedge_pnl:+,.0f}", delta=f"現價: {last_close:,.0f}", color=hedge_pnl_color)
                 else:
                     metric_card("避險損益", "-", color="orange")
         
